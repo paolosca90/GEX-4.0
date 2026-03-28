@@ -5,6 +5,8 @@ import './App.css'
 import { GreeksPanel } from './components/GreeksPanel'
 import { AlertsPanel } from './components/AlertsPanel'
 import { DarkPoolPanel } from './components/DarkPoolPanel'
+import { ReversalGauge } from './components/ReversalGauge'
+import { VolSurface } from './components/VolSurface'
 import logo from './assets/gex.png'
 
 const API_BASE = `${window.location.protocol}//${window.location.host}`
@@ -42,11 +44,36 @@ type GexLevel = {
   futurePrice: number
 }
 
+export interface KeyLevel {
+  price: number
+  gex?: number
+  label: string
+  type: 'zero_gamma' | 'call' | 'put'
+}
+
+export interface KeyLevels {
+  zgl: KeyLevel | null
+  call_wall: KeyLevel | null
+  put_wall: KeyLevel | null
+  top_call: KeyLevel | null
+  top_put: KeyLevel | null
+}
+
+export interface FlowConcentration {
+  strike: number
+  call_premium: number
+  put_premium: number
+  net_premium: number
+  dominant: 'call' | 'put'
+}
+
 const ChartPanel: React.FC<ChartPanelProps> = ({ symbol, underlying, label, isExpanded, onExpandToggle }) => {
   const [candles, setCandles] = useState<CandleData[]>([])
   const [lastTick, setLastTick] = useState<TickData | null>(null)
   const [lastPrice, setLastPrice] = useState<number | null>(null)
   const [gexData, setGexData] = useState<GexLevel[]>([])
+  const [keyLevels, setKeyLevels] = useState<KeyLevels | null>(null)
+  const [flowConcentration, setFlowConcentration] = useState<FlowConcentration[]>([])
 
   // Timeframe state
   const [intervalOption, setIntervalOption] = useState<'1m' | '5m' | '15m'>('1m')
@@ -90,22 +117,9 @@ const ChartPanel: React.FC<ChartPanelProps> = ({ symbol, underlying, label, isEx
   }
 
   const zeroGamma = React.useMemo(() => {
-    if (!gexData || gexData.length === 0) return null
-    const sorted = [...gexData].sort((a, b) => a.futurePrice - b.futurePrice)
-    
-    let cumulative = 0;
-    let minCumulative = Infinity;
-    let flipPrice = sorted[Math.floor(sorted.length / 2)]?.futurePrice;
-    
-    for (const level of sorted) {
-        cumulative += level.gex;
-        if (cumulative < minCumulative) {
-            minCumulative = cumulative;
-            flipPrice = level.futurePrice;
-        }
-    }
-    return flipPrice ? flipPrice.toFixed(0) : null
-  }, [gexData])
+    if (keyLevels?.zgl) return keyLevels.zgl.price.toFixed(0)
+    return null
+  }, [keyLevels])
 
   useEffect(() => {
     const fetchCandles = async () => {
@@ -132,12 +146,33 @@ const ChartPanel: React.FC<ChartPanelProps> = ({ symbol, underlying, label, isEx
         if (data.gex && data.gex.length > 0) {
           setGexData(data.gex)
         }
+        if (data.key_levels) {
+          setKeyLevels(data.key_levels)
+        }
       } catch (err) {
         console.error('Failed to fetch GEX:', err)
       }
     }
     fetchGex()
     const interval = setInterval(fetchGex, 60000)
+    return () => clearInterval(interval)
+  }, [underlying])
+
+  // Fetch flow concentration (aggregated by strike from our Tradier flow data)
+  useEffect(() => {
+    const fetchConcentration = async () => {
+      try {
+        const resp = await fetch(`${API_BASE}/api/flow/concentration/${underlying}?bars=5&lookback_minutes=1440`)
+        const data = await resp.json()
+        if (data.concentration && data.concentration.length > 0) {
+          setFlowConcentration(data.concentration)
+        }
+      } catch (err) {
+        console.error('Failed to fetch flow concentration:', err)
+      }
+    }
+    fetchConcentration()
+    const interval = setInterval(fetchConcentration, 120000) // refresh every 2 min
     return () => clearInterval(interval)
   }, [underlying])
 
@@ -185,7 +220,7 @@ const ChartPanel: React.FC<ChartPanelProps> = ({ symbol, underlying, label, isEx
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         <div className="chart-container" style={{ flex: 1 }}>
           <div className="chart-main">
-            <LightweightChart candles={candles} lastTick={lastTick} gexData={gexData} />
+            <LightweightChart candles={candles} lastTick={lastTick} gexData={gexData} keyLevels={keyLevels} flowConcentration={flowConcentration} />
             <div
               className="smart-money-overlay"
               style={{ left: pos.x, top: pos.y }}
@@ -199,6 +234,8 @@ const ChartPanel: React.FC<ChartPanelProps> = ({ symbol, underlying, label, isEx
           </div>
         </div>
         <div className="sidebar-panel" style={{ padding: '0.5rem', overflowY: 'auto' }}>
+          <ReversalGauge underlying={underlying} />
+          <VolSurface underlying={underlying} />
           <GreeksPanel underlying={underlying} />
           <AlertsPanel />
           <DarkPoolPanel underlying={underlying} />
@@ -223,7 +260,7 @@ function App() {
       ws.onmessage = (event) => {
         try {
           const msg: TickData = JSON.parse(event.data)
-          if (msg.type === 'tick' || msg.type === 'flow_tick') {
+          if (msg.type === 'tick' || msg.type === 'flow_tick' || msg.type === 'reversal_signal') {
             window.dispatchEvent(new CustomEvent('market_tick', { detail: msg }))
           }
           if (msg.type === 'alert') {
