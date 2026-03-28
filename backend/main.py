@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from greeks_service import GreeksService
 from alert_engine import AlertEngine
 from darkpool_analyzer import DarkPoolAnalyzer
+from reversal_engine import ReversalEngine
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gex_backend")
@@ -26,6 +27,7 @@ db_pool = None
 greeks_service = None
 alert_engine = None
 darkpool_analyzer = None
+reversal_engine = None
 
 @app.on_event("startup")
 async def startup_event():
@@ -46,17 +48,19 @@ async def startup_event():
     asyncio.create_task(start_gex_engine())
 
     # Initialize institutional MVP services
-    global greeks_service, alert_engine, darkpool_analyzer
+    global greeks_service, alert_engine, darkpool_analyzer, reversal_engine
     greeks_service = GreeksService(db_pool)
     alert_engine = AlertEngine(db_pool, broadcast_fn=manager.broadcast)
     darkpool_analyzer = DarkPoolAnalyzer(db_pool)
+    reversal_engine = ReversalEngine(db_pool)
     asyncio.create_task(darkpool_analyzer.update_daily())
+    asyncio.create_task(broadcast_reversal_signals())
 
 
 # ──────────────────────────── WebSocket Manager ────────────────────────────
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: list[WebSocket] = []
+        self.active_connections: list = []
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -177,6 +181,46 @@ async def broadcast_flow_ticks():
             logger.error(f"Flow broadcast error: {e}")
 
         await asyncio.sleep(2)
+
+
+# ──────────────────────────── Background Reversal Signal Broadcaster ─────────────────
+async def _fetch_price_and_signal(underlying: str, futures_sym: str):
+    """Fetch latest price and compute reversal signal for one underlying."""
+    price_row = await db_pool.fetchrow('''
+        SELECT price FROM futures_ticks
+        WHERE symbol = $1 AND time > NOW() - INTERVAL '5 minutes'
+        ORDER BY time DESC LIMIT 1
+    ''', futures_sym)
+    if not price_row:
+        return None
+    current_price = float(price_row["price"])
+    signal = await reversal_engine.get_reversal_signal(underlying, futures_sym, current_price)
+    return {"type": "reversal_signal", **signal}
+
+
+async def broadcast_reversal_signals():
+    """Compute and broadcast reversal signals every 5 seconds."""
+    global reversal_engine, db_pool
+    await asyncio.sleep(5)  # wait for startup
+
+    while True:
+        try:
+            if db_pool and reversal_engine and manager.active_connections:
+                # Parallel DB query + signal computation for both underlyings
+                results = await asyncio.gather(
+                    _fetch_price_and_signal("SPX", "US500-F"),
+                    _fetch_price_and_signal("QQQ", "NAS100-F"),
+                )
+                for signal in results:
+                    if signal is None:
+                        continue
+                    await manager.broadcast(signal)
+                    # Fire alert if confluence > 70 and direction is not NEUTRAL
+                    if alert_engine and signal["confluence"] >= 70 and signal["direction"] != "NEUTRAL":
+                        await alert_engine.fire_reversal_alert(signal)
+        except Exception as e:
+            logger.error(f"Reversal broadcast error: {e}")
+        await asyncio.sleep(5)
 
 
 # ──────────────────────────── REST Endpoints ────────────────────────────
@@ -348,6 +392,96 @@ async def get_options_flow_by_symbol(
     return {"flow": flow_data}
 
 
+@app.get("/api/flow/concentration/{underlying}")
+async def get_flow_concentration(
+    underlying: str,
+    bars: int = Query(5, description="Top N levels per side"),
+    lookback_minutes: int = Query(60, description="Lookback window in minutes"),
+):
+    """
+    Aggregate options_flow by strike to find concentration levels.
+    Returns top call and put concentration levels where institutional flow is heaviest.
+    Not true darkpool — aggregates our Tradier flow data by strike.
+    """
+    if not db_pool:
+        return {"error": "DB not connected"}
+
+    underlying = underlying.upper()
+    if underlying not in ("SPX", "QQQ"):
+        return {"error": "Invalid underlying"}
+
+    try:
+        rows = await db_pool.fetch('''
+            SELECT
+                strike,
+                option_type,
+                SUM(trade_premium) AS total_premium,
+                SUM(trade_size) AS total_volume,
+                COUNT(*) AS trade_count
+            FROM options_flow
+            WHERE underlying = $1
+              AND time > NOW() - make_interval(mins => $2)
+            GROUP BY strike, option_type
+            ORDER BY strike
+        ''', underlying, lookback_minutes)
+    except Exception as e:
+        logger.error(f"Flow concentration query error: {e}")
+        return {"underlying": underlying, "concentration": [], "updated_at": None, "error": str(e)}
+
+    if not rows:
+        return {"underlying": underlying, "concentration": [], "updated_at": None}
+
+    # Aggregate by strike
+    strike_data: dict[float, dict] = {}
+    for r in rows:
+        strike = float(r["strike"])
+        opt_type = r["option_type"].upper()
+        premium = float(r["total_premium"] or 0)
+        volume = int(r["total_volume"] or 0)
+
+        if strike not in strike_data:
+            strike_data[strike] = {"call_premium": 0.0, "put_premium": 0.0, "call_volume": 0, "put_volume": 0}
+
+        if opt_type == "CALL":
+            strike_data[strike]["call_premium"] += premium
+            strike_data[strike]["call_volume"] += volume
+        else:
+            strike_data[strike]["put_premium"] += premium
+            strike_data[strike]["put_volume"] += volume
+
+    # Build concentration list
+    concentration = []
+    for strike, data in strike_data.items():
+        call_p = data["call_premium"]
+        put_p = data["put_premium"]
+        net = call_p - put_p
+        if call_p > 0 or put_p > 0:
+            concentration.append({
+                "strike": strike,
+                "call_premium": round(call_p, 0),
+                "put_premium": round(put_p, 0),
+                "net_premium": round(net, 0),
+                "call_volume": data["call_volume"],
+                "put_volume": data["put_volume"],
+                "dominant": "call" if call_p > put_p else "put",
+            })
+
+    # Sort by absolute premium and take top N per side
+    call_sorted = sorted([c for c in concentration if c["dominant"] == "call"],
+                         key=lambda x: x["call_premium"], reverse=True)[:bars]
+    put_sorted = sorted([c for c in concentration if c["dominant"] == "put"],
+                        key=lambda x: x["put_premium"], reverse=True)[:bars]
+
+    # Merge, sort by strike
+    all_levels = sorted(call_sorted + put_sorted, key=lambda x: x["strike"])
+
+    return {
+        "underlying": underlying,
+        "concentration": all_levels,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @app.get("/api/candles/{symbol}")
 async def get_candles(
     symbol: str,
@@ -517,25 +651,17 @@ async def get_level_reliability(
 
 def get_next_trading_day():
     """
-    Get the next trading day considering weekends.
-    After 16:30 EST (21:30 UTC), today's 0DTE are expired, so return next trading day.
+    Get the next trading day. Always skips weekends.
+    Market is closed Sat/Sun, so we always return the next Monday
+    regardless of whether it's before or after market close.
     """
-    # Current time in EST (UTC-5)
     est = timezone(timedelta(hours=-5))
     now_est = datetime.now(est)
-
-    # Market close time: 16:30 EST (settlement)
-    market_close_est = now_est.replace(hour=16, minute=30, second=0, microsecond=0)
-
-    # If after market close, get next trading day
-    if now_est > market_close_est:
-        next_day = now_est.date() + timedelta(days=1)
-        # Skip weekends
-        while next_day.weekday() >= 5:  # 5=Saturday, 6=Sunday
-            next_day += timedelta(days=1)
-        return next_day
-    else:
-        return now_est.date()
+    target = now_est.date()
+    # Skip weekend days
+    while target.weekday() >= 5:
+        target += timedelta(days=1)
+    return target
 
 
 async def get_dynamic_offset(underlying: str):
@@ -585,17 +711,30 @@ async def get_dynamic_offset(underlying: str):
             if spot_row:
                 spot_price = float(spot_row['price'])
             else:
-                # Fallback to cTrader Cash CFD spot (can be up to 24h old, e.g. over weekend)
-                fallback_row = await db_pool.fetchrow('''
-                    SELECT price FROM futures_ticks
-                    WHERE symbol = $1 AND time > NOW() - INTERVAL '24 hours'
-                    ORDER BY time DESC LIMIT 1
-                ''', fallback_spot_sym)
-                if fallback_row:
-                    spot_price = float(fallback_row['price'])
-                    source_sym = fallback_spot_sym
-                    # Only log warning/fallback occasionally to avoid spam, debug is fine here
-                    logger.debug(f"Using fallback cTrader Spot {fallback_spot_sym} for {underlying}")
+                # For multiplicative mode (QQQ): we need QQQ spot, NOT NAS100-CFD.
+                # If QQQ fresh (5min) is unavailable, try to get ANY QQQ from last 24h.
+                # The cTrader NAS100-CFD is NOT a valid substitute for QQQ in multiplicative mode.
+                if mode == 'multiplicative':
+                    any_qqq_row = await db_pool.fetchrow('''
+                        SELECT price FROM futures_ticks
+                        WHERE symbol = $1 AND time > NOW() - INTERVAL '24 hours'
+                        ORDER BY time DESC LIMIT 1
+                    ''', spot_sym)
+                    if any_qqq_row:
+                        spot_price = float(any_qqq_row['price'])
+                        source_sym = spot_sym
+                        logger.debug(f"Using stale QQQ price {spot_price} for {underlying} multiplier")
+                if spot_price is None:
+                    # Fallback to cTrader Cash CFD spot (only for additive mode, e.g. SPX)
+                    fallback_row = await db_pool.fetchrow('''
+                        SELECT price FROM futures_ticks
+                        WHERE symbol = $1 AND time > NOW() - INTERVAL '24 hours'
+                        ORDER BY time DESC LIMIT 1
+                    ''', fallback_spot_sym)
+                    if fallback_row:
+                        spot_price = float(fallback_row['price'])
+                        source_sym = fallback_spot_sym
+                        logger.debug(f"Using fallback cTrader Spot {fallback_spot_sym} for {underlying}")
 
             if spot_price is not None:
                 if mode == 'additive':
@@ -613,6 +752,12 @@ async def get_dynamic_offset(underlying: str):
             logger.warning(f"Missing Future price data for {underlying}")
     except Exception as e:
         logger.error(f"Error calculating offset: {e}")
+
+    # Hardcoded fallback for QQQ when all data is stale (e.g., weekend with no QQQ data).
+    # NAS100-F / QQQ ≈ 41.4 (e.g., 23274 / 562 ≈ 41.4)
+    if underlying == 'QQQ':
+        logger.warning(f"Using hardcoded QQQ ratio 41.4 as last resort")
+        return (0.0, 41.4)
 
     return (0.0, 1.0)
 
@@ -691,16 +836,99 @@ async def get_gex_latest(underlying: str = Query(None, description="Filter by un
         if r["underlying"] == row_underlying  # Only return data for one underlying
     ]
 
+    # Calculate key levels
+    # 1. Zero Gamma Level (ZGL): price where cumulative GEX is minimized
+    sorted_levels = sorted(gex_data, key=lambda x: x["futurePrice"])
+    cumulative = 0
+    min_cumulative = float("inf")
+    zgl = sorted_levels[len(sorted_levels) // 2]["futurePrice"]
+    for level in sorted_levels:
+        cumulative += level["gex"]
+        if cumulative < min_cumulative:
+            min_cumulative = cumulative
+            zgl = level["futurePrice"]
+
+    # 2. Call Wall: maximum positive gex
+    call_levels = [level for level in gex_data if level["gex"] > 0]
+    if call_levels:
+        call_wall_level = max(call_levels, key=lambda x: x["gex"])
+        call_wall = {
+            "price": call_wall_level["futurePrice"],
+            "gex": call_wall_level["gex"],
+            "label": "Call Wall",
+            "type": "call"
+        }
+    else:
+        call_wall = None
+
+    # 3. Put Wall: minimum (most negative) gex
+    put_levels = [level for level in gex_data if level["gex"] < 0]
+    if put_levels:
+        put_wall_level = min(put_levels, key=lambda x: x["gex"])
+        put_wall = {
+            "price": put_wall_level["futurePrice"],
+            "gex": put_wall_level["gex"],
+            "label": "Put Wall",
+            "type": "put"
+        }
+    else:
+        put_wall = None
+
+    # 4. Top Call GEX #2: second-highest positive gex
+    if len(call_levels) >= 2:
+        sorted_calls = sorted(call_levels, key=lambda x: x["gex"], reverse=True)
+        top_call_level = sorted_calls[1]
+        top_call = {
+            "price": top_call_level["futurePrice"],
+            "gex": top_call_level["gex"],
+            "label": f"Call {top_call_level['strike']}",
+            "type": "call"
+        }
+    else:
+        top_call = None
+
+    # 5. Top Put GEX #2: second-most-negative gex
+    if len(put_levels) >= 2:
+        sorted_puts = sorted(put_levels, key=lambda x: x["gex"])
+        top_put_level = sorted_puts[1]
+        top_put = {
+            "price": top_put_level["futurePrice"],
+            "gex": top_put_level["gex"],
+            "label": f"Put {top_put_level['strike']}",
+            "type": "put"
+        }
+    else:
+        top_put = None
+
+    key_levels = {
+        "zgl": {"price": zgl, "label": "ZGL", "type": "zero_gamma"},
+        "call_wall": call_wall,
+        "put_wall": put_wall,
+        "top_call": top_call,
+        "top_put": top_put,
+    }
+
     # Update alert engine GEX cache
     if alert_engine:
         alert_engine.update_gex_cache(row_underlying, gex_data)
 
+    # Update reversal engine GEX cache
+    if reversal_engine:
+        reversal_engine.update_gex_cache(row_underlying, gex_data)
+
+    # ALWAYS compute fresh offset from current futures prices (ignore stored offset)
+    fresh_offset, fresh_multiplier = await get_dynamic_offset(row_underlying)
+    # Clamp to reasonable range to detect stale data (if offset > 100 it's obviously wrong)
+    if abs(fresh_offset) > 100 or fresh_multiplier <= 0:
+        logger.warning(f"Stale offset detected for {row_underlying}: offset={fresh_offset}, mult={fresh_multiplier}")
+
     return {
         "gex": gex_data,
+        "key_levels": key_levels,
         "target_date": str(target_date),
         "underlying": row_underlying,
-        "offset": offset,
-        "multiplier": multiplier,
+        "offset": fresh_offset,
+        "multiplier": fresh_multiplier,
     }
 
 
@@ -925,6 +1153,46 @@ async def get_zone_alert(
         return {"in_zone": False, "signal": "NEUTRAL", "error": str(e)}
 
 
+# ──────────────────────────── Reversal Signal Endpoint ────────────────────────────
+@app.get("/api/reversal/{underlying}")
+async def get_reversal_signal(
+    underlying: str,
+    futures_symbol: str = Query(None, description="Futures symbol: US500-F or NAS100-F"),
+):
+    """
+    Return composite reversal confluence signal for 0DTE scalping.
+    Score 0-100: >70 = high-probability reversal, 40-60 = neutral.
+    Components: GEX Proximity, Flow Divergence, Price Extension, Trap Signal, Gamma Regime.
+    """
+    if not db_pool:
+        return {"error": "DB not connected"}
+
+    underlying = underlying.upper()
+    if futures_symbol:
+        futures_symbol = futures_symbol.upper()
+    else:
+        futures_symbol = 'US500-F' if underlying == 'SPX' else 'NAS100-F'
+
+    try:
+        price_row = await db_pool.fetchrow('''
+            SELECT price FROM futures_ticks
+            WHERE symbol = $1 AND time > NOW() - INTERVAL '5 minutes'
+            ORDER BY time DESC LIMIT 1
+        ''', futures_symbol)
+
+        current_price = float(price_row['price']) if price_row else 0.0
+
+        if current_price == 0:
+            return {"confluence": 0, "direction": "NEUTRAL", "error": "No price data"}
+
+        signal = await reversal_engine.get_reversal_signal(underlying, futures_symbol, current_price)
+        return signal
+
+    except Exception as e:
+        logger.error(f"Reversal signal error: {e}", exc_info=True)
+        return {"confluence": 0, "direction": "NEUTRAL", "error": str(e)}
+
+
 # ──────────────────────────── Greeks Endpoints ────────────────────────────
 @app.get("/api/greeks/{underlying}")
 async def get_greeks(underlying: str):
@@ -940,6 +1208,22 @@ async def get_greeks_summary(underlying: str):
     if not greeks_service:
         return {"error": "Greeks service not initialized"}
     return await greeks_service.get_greeks_summary(underlying.upper())
+
+
+@app.get("/api/volatility/surface")
+async def get_volatility_surface_endpoint(underlying: str = Query(..., description="Underlying: SPX or QQQ")):
+    """
+    Return volatility surface data for 0DTE + 1DTE.
+    Includes IV, skew, delta, gamma per strike.
+    """
+    if not greeks_service:
+        return {"error": "Service not available", "surface": []}
+    try:
+        data = await greeks_service.get_volatility_surface(underlying)
+        return data
+    except Exception as e:
+        logger.error(f"Volatility surface error: {e}")
+        return {"error": str(e), "surface": []}
 
 
 # ──────────────────────────── Alert Endpoints ────────────────────────────
