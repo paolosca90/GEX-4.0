@@ -221,7 +221,7 @@ const ChartPanel: React.FC<ChartPanelProps> = ({ symbol, underlying, label, isEx
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         <div className="chart-container" style={{ flex: 1 }}>
           <div className="chart-main">
-            <LightweightChart candles={candles} lastTick={lastTick} gexData={gexData} keyLevels={keyLevels} flowConcentration={flowConcentration} />
+            <LightweightChart candles={candles} lastTick={lastTick} gexData={gexData} keyLevels={keyLevels} flowConcentration={flowConcentration} underlying={underlying} />
             <div
               className="smart-money-overlay"
               style={{ left: pos.x, top: pos.y }}
