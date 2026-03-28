@@ -2,6 +2,7 @@
 Greeks Service - fetches option chain from Tradier with ORATS Greeks.
 Caches results in memory with 60s TTL during RTH.
 """
+import asyncio
 import os
 import time
 import logging
@@ -10,9 +11,13 @@ from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger("greeks_service")
 
-TRADIER_API_KEY = os.getenv("TRADIER_API_KEY", "dHegDyUwRPC6Os2qaiGBYtvAEOQC")
-TRADIER_BASE = "https://api.tradier.com/v1/markets/options/chains"
+TRADIER_API_KEY = os.getenv("TRADIER_API_KEY", "mVoOWSiu47rIQoSq2u2C0fZxOtwc")
+TRADIER_CHAIN_URL = "https://api.tradier.com/v1/markets/options/chains"
+TRADIER_EXPIRATIONS_URL = "https://api.tradier.com/v1/markets/options/expirations"
+TRADIER_QUOTES_URL = "https://api.tradier.com/v1/markets/quotes"
 
+# SPX and QQQ both have daily expirations on Tradier with ORATS greeks.
+# Query them directly — no mapping needed.
 CHAIN_SYMBOLS = {
     "SPX": "SPX",
     "QQQ": "QQQ",
@@ -40,35 +45,67 @@ class GreeksService:
         self.db_pool = db_pool
         self.cache = GreeksCache(ttl_seconds=60)
 
-    async def _get_target_date(self) -> str:
-        """Get the current 0DTE date."""
-        est = timezone(timedelta(hours=-5))
-        now_est = datetime.now(est)
-        market_close = now_est.replace(hour=16, minute=30, second=0, microsecond=0)
-        if now_est > market_close:
-            next_day = now_est.date() + timedelta(days=1)
-            while next_day.weekday() >= 5:
-                next_day += timedelta(days=1)
-            return next_day.isoformat()
-        return now_est.date().isoformat()
+    async def _get_spot_from_quotes(self, symbol: str) -> float:
+        """Get spot price from Tradier quotes endpoint."""
+        headers = {
+            "Authorization": f"Bearer {TRADIER_API_KEY}",
+            "Accept": "application/json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(f"{TRADIER_QUOTES_URL}?symbols={symbol}", headers=headers)
+                if resp.status_code == 200:
+                    quotes = resp.json().get("quotes", {}).get("quote", [])
+                    if isinstance(quotes, dict):
+                        quotes = [quotes]
+                    if quotes:
+                        last = quotes[0].get("last")
+                        if last:
+                            return float(last)
+        except Exception as e:
+            logger.error(f"Quotes fetch error: {e}")
+        return 0.0
 
     async def _fetch_chain(self, underlying: str) -> list:
-        """Fetch option chain from Tradier with greeks=true."""
-        target_date = await self._get_target_date()
+        """Fetch option chain from Tradier with greeks=true.
+        Queries available expirations first, then tries each until we get options."""
         symbol = CHAIN_SYMBOLS.get(underlying, underlying)
-        url = f"{TRADIER_BASE}?symbol={symbol}&expiration={target_date}&greeks=true"
         headers = {
             "Authorization": f"Bearer {TRADIER_API_KEY}",
             "Accept": "application/json",
         }
         try:
             async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(url, headers=headers)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    options = data.get("options", {}).get("option", [])
-                    return options
-                logger.error(f"Tradier API error {underlying}: {resp.status_code}")
+                # First get available expirations (includeAllRoots to get SPXW weeklys too)
+                exp_url = f"{TRADIER_EXPIRATIONS_URL}?symbol={symbol}&includeAllRoots=true"
+                exp_resp = await client.get(exp_url, headers=headers)
+                available_dates = []
+                if exp_resp.status_code == 200:
+                    exp_data = exp_resp.json()
+                    available_dates = exp_data.get("expirations", {}).get("date", [])
+
+                if not available_dates:
+                    logger.warning(f"No expirations found for {underlying} ({symbol})")
+                    return []
+
+                # Probe up to 5 expirations concurrently; return first with options
+                async def try_expiry(exp: str):
+                    url = f"{TRADIER_CHAIN_URL}?symbol={symbol}&expiration={exp}&greeks=true"
+                    resp = await client.get(url, headers=headers)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        opts = data.get("options", {}).get("option", [])
+                        if opts:
+                            return opts, exp
+                    return None, exp
+
+                # Fire all requests in parallel; first successful one wins
+                results = await asyncio.gather(*[try_expiry(exp) for exp in available_dates[:5]])
+                for options, exp in results:
+                    if options:
+                        logger.info(f"Tradier chain OK: {underlying} ({symbol}) exp={exp} | {len(options)} options")
+                        return options
+                logger.warning(f"No chain data for {underlying} ({symbol}) across {[exp for exp in available_dates[:5]]}")
         except Exception as e:
             logger.error(f"Tradier fetch error: {e}")
         return []
@@ -83,18 +120,23 @@ class GreeksService:
         if not raw_options:
             return {"chain": [], "summary": {}, "underlying": underlying, "spot": None}
 
-        spot = None
-        for opt in raw_options:
-            greeks = opt.get("greeks") or {}
-            if greeks.get("mid_iv"):
-                spot = opt.get("underlying_price")
-                break
+        # Get spot price from Tradier quotes endpoint
+        chain_symbol = CHAIN_SYMBOLS.get(underlying, underlying)
+        spot = await self._get_spot_from_quotes(chain_symbol)
         if not spot:
-            spot = raw_options[0].get("underlying_price", 0)
+            # Fallback: try to infer from strike range + greeks
+            logger.warning(f"Spot price unavailable from quotes for {chain_symbol}, skipping ATM filter")
+            spot = 0.0
 
-        lower = spot * 0.95
-        upper = spot * 1.05
-        filtered = [o for o in raw_options if lower <= o.get("strike", 0) <= upper]
+        if spot > 0:
+            lower = spot * 0.95
+            upper = spot * 1.05
+            filtered = [o for o in raw_options if lower <= o.get("strike", 0) <= upper]
+        else:
+            # Last resort: no filter, use all options
+            filtered = raw_options
+
+        logger.info(f"Greeks filter: {underlying} spot={spot} | {len(filtered)}/{len(raw_options)} options in ATM±5%")
 
         chain = []
         for opt in filtered:
@@ -218,4 +260,108 @@ class GreeksService:
             "avg_theta_decay": round(s["avg_theta"], 4) if s.get("avg_theta") else None,
             "iv_context": iv_context,
             "greeks_by_expiry": greeks_by_expiry,
+        }
+
+    async def get_volatility_surface(self, underlying: str) -> dict:
+        """
+        Fetch volatility surface for 0DTE + 1DTE expirations.
+        Returns strikes with IV, delta, gamma, call_iv, put_iv, skew per strike.
+        """
+        symbol = CHAIN_SYMBOLS.get(underlying, underlying)
+        headers = {
+            "Authorization": f"Bearer {TRADIER_API_KEY}",
+            "Accept": "application/json",
+        }
+
+        # Step 1: get available expirations
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                exp_url = f"{TRADIER_EXPIRATIONS_URL}?symbol={symbol}&includeAllRoots=true"
+                exp_resp = await client.get(exp_url, headers=headers)
+                available_dates = []
+                if exp_resp.status_code == 200:
+                    exp_data = exp_resp.json()
+                    raw_dates = exp_data.get("expirations", {}).get("date", [])
+                    if isinstance(raw_dates, list):
+                        available_dates = raw_dates[:5]  # take first 5 expirations
+        except Exception as e:
+            logger.error(f"Expirations fetch error: {e}")
+            return {"error": str(e), "surface": [], "underlying": underlying}
+
+        # Step 2: fetch chains for up to 2 expirations in parallel
+        async def fetch_single_expiry(exp: str):
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    url = f"{TRADIER_CHAIN_URL}?symbol={symbol}&expiration={exp}&greeks=true"
+                    resp = await client.get(url, headers=headers)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        opts = data.get("options", {}).get("option", [])
+                        if opts:
+                            return opts, exp
+            except Exception as e:
+                logger.error(f"Chain fetch error for {exp}: {e}")
+            return [], exp
+
+        # Only use first 2 expirations (0DTE + 1DTE)
+        results = await asyncio.gather(*[fetch_single_expiry(exp) for exp in available_dates[:2]])
+
+        surface = []
+        for options, exp in results:
+            if not options:
+                continue
+
+            strikes_map = {}
+            for opt in options:
+                strike = float(opt.get("strike", 0))
+                greeks = opt.get("greeks") or {}
+                option_type = opt.get("option_type")
+                mid_iv = greeks.get("mid_iv") or 0.0
+
+                if strike not in strikes_map:
+                    strikes_map[strike] = {
+                        "strike": strike,
+                        "delta": greeks.get("delta"),
+                        "gamma": greeks.get("gamma"),
+                    }
+                if option_type == "call":
+                    strikes_map[strike]["call_iv"] = mid_iv
+                else:
+                    strikes_map[strike]["put_iv"] = mid_iv
+
+            # Compute skew and ATM flag per strike
+            for strike, data in strikes_map.items():
+                call_iv = data.get("call_iv", 0)
+                put_iv = data.get("put_iv", 0)
+                data["iv"] = (call_iv + put_iv) / 2 if call_iv and put_iv else (call_iv or put_iv or 0)
+                data["skew"] = put_iv - call_iv if call_iv and put_iv else 0
+
+            strikes_list = list(strikes_map.values())
+
+            # Determine DTE
+            try:
+                exp_dt = datetime.strptime(exp, "%Y-%m-%d").date()
+                today = datetime.now(timezone(timedelta(hours=-5))).date()
+                dte = max(0, (exp_dt - today).days)
+            except Exception:
+                dte = 0
+
+            surface.append({
+                "expiration": exp,
+                "days_to_expiry": dte,
+                "strikes": strikes_list,
+            })
+
+        # Get spot price
+        spot = await self._get_spot_from_quotes(symbol)
+        if not spot:
+            # Fallback to any available strike midpoint
+            if surface and surface[0]["strikes"]:
+                spot = surface[0]["strikes"][len(surface[0]["strikes"])//2]["strike"]
+
+        return {
+            "underlying": underlying,
+            "spot_price": spot,
+            "surface": surface,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         }
