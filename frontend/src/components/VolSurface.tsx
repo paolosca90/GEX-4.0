@@ -135,7 +135,8 @@ export const VolSurface: React.FC<VolSurfaceProps> = ({ underlying }) => {
         const x = col * CELL_WIDTH;
         const y = HEADER_HEIGHT + row * CELL_HEIGHT;
 
-        ctx.fillStyle = interpolateColor(expStrike.iv);
+        const cellIv = expStrike.iv ?? 0;
+        ctx.fillStyle = interpolateColor(cellIv);
         ctx.fillRect(x + 1, y + 1, CELL_WIDTH - 2, CELL_HEIGHT - 2);
 
         if (isATM) {
@@ -189,12 +190,12 @@ export const VolSurface: React.FC<VolSurfaceProps> = ({ underlying }) => {
           ref={canvasRef}
           style={{ display: 'block', width: '100%' }}
           onMouseMove={(e) => {
-            const canvas = canvasRef.current;
-            if (!canvas) return;
-            const rect = canvas.getBoundingClientRect();
+            const container = containerRef.current;
+            if (!container) return;
+            const rect = container.getBoundingClientRect();
             const x = e.clientX - rect.left;
             const y = e.clientY - rect.top;
-            const col = Math.floor(x / (canvas.width / surface.length));
+            const col = Math.floor(x / (container.clientWidth / surface.length));
             const HEADER_HEIGHT = 24;
             const CELL_HEIGHT = 22;
             const row = Math.floor((y - HEADER_HEIGHT) / CELL_HEIGHT);
@@ -206,7 +207,7 @@ export const VolSurface: React.FC<VolSurfaceProps> = ({ underlying }) => {
               const strike = bucketedStrikes[row];
               const expStrike = exp?.strikes?.find(s => s.strike === strike?.strike);
               if (expStrike) {
-                setHoveredCell({ expiry: exp.expiration, strike: expStrike, x: e.clientX, y: e.clientY });
+                setHoveredCell({ expiry: exp.expiration, strike: expStrike, x, y });
               }
             }
           }}
@@ -215,7 +216,7 @@ export const VolSurface: React.FC<VolSurfaceProps> = ({ underlying }) => {
         {hoveredCell && (
           <div
             style={{
-              position: 'fixed',
+              position: 'absolute',
               left: hoveredCell.x + 12,
               top: hoveredCell.y - 60,
               background: 'rgba(15,23,42,0.95)',
@@ -231,10 +232,10 @@ export const VolSurface: React.FC<VolSurfaceProps> = ({ underlying }) => {
           >
             <div style={{ fontWeight: 600, marginBottom: 3 }}>{hoveredCell.expiry}</div>
             <div>Strike: <b>{hoveredCell.strike.strike.toFixed(0)}</b></div>
-            <div>IV: <b>{(hoveredCell.strike.iv * 100).toFixed(1)}%</b></div>
-            <div>C IV: {(hoveredCell.strike.call_iv * 100).toFixed(1)}% | P IV: {(hoveredCell.strike.put_iv * 100).toFixed(1)}%</div>
-            <div>Skew: <b style={{ color: hoveredCell.strike.skew > 0 ? '#ef4444' : '#3b82f6' }}>{(hoveredCell.strike.skew * 100).toFixed(1)}%</b></div>
-            <div>Delta: {hoveredCell.strike.delta?.toFixed(3)} | Gamma: {hoveredCell.strike.gamma?.toFixed(4)}</div>
+            <div>IV: <b>{(hoveredCell.strike.iv != null ? (hoveredCell.strike.iv * 100).toFixed(1) : 'N/A')}%</b></div>
+            <div>C IV: {hoveredCell.strike.call_iv != null ? (hoveredCell.strike.call_iv * 100).toFixed(1) : 'N/A'}% | P IV: {hoveredCell.strike.put_iv != null ? (hoveredCell.strike.put_iv * 100).toFixed(1) : 'N/A'}%</div>
+            <div>Skew: <b style={{ color: hoveredCell.strike.skew > 0 ? '#ef4444' : '#3b82f6' }}>{hoveredCell.strike.skew != null ? (hoveredCell.strike.skew * 100).toFixed(1) : 'N/A'}%</b></div>
+            <div>Delta: {hoveredCell.strike.delta?.toFixed(3) ?? 'N/A'} | Gamma: {hoveredCell.strike.gamma?.toFixed(4) ?? 'N/A'}</div>
           </div>
         )}
       </div>
