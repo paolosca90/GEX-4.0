@@ -8,6 +8,7 @@ import time
 import logging
 import httpx
 from datetime import datetime, timezone, timedelta
+from typing import List
 
 logger = logging.getLogger("greeks_service")
 
@@ -232,7 +233,7 @@ class GreeksService:
             "atm_iv": round(atm_iv, 4) if atm_iv else None,
             "iv_rank_52w": None,
             "iv_percentile_52w": None,
-            "skew_25delta": round(s["skew"], 4) if s.get("skew") else None,
+            "skew_25delta": round(s.get("skew", 0), 4) if s.get("skew") else None,
             "term_structure": "unknown",
         }
 
@@ -257,7 +258,7 @@ class GreeksService:
             "regime": regime,
             "total_gex": total_gex,
             "net_delta_exposure": round(s.get("net_delta", 0) or 0, 4),
-            "avg_theta_decay": round(s["avg_theta"], 4) if s.get("avg_theta") else None,
+            "avg_theta_decay": round(s.get("avg_theta", 0), 4) if s.get("avg_theta") else None,
             "iv_context": iv_context,
             "greeks_by_expiry": greeks_by_expiry,
         }
@@ -325,14 +326,15 @@ class GreeksService:
                         "gamma": greeks.get("gamma"),
                     }
                 if option_type == "call":
-                    strikes_map[strike]["call_iv"] = mid_iv
+                    strikes_map[strike]["call_iv"] = mid_iv / 100 if mid_iv > 1 else mid_iv
                 else:
-                    strikes_map[strike]["put_iv"] = mid_iv
+                    strikes_map[strike]["put_iv"] = mid_iv / 100 if mid_iv > 1 else mid_iv
 
             # Compute skew and ATM flag per strike
             for strike, data in strikes_map.items():
                 call_iv = data.get("call_iv", 0)
                 put_iv = data.get("put_iv", 0)
+                # Normalization already applied at storage time (lines 328-330)
                 data["iv"] = (call_iv + put_iv) / 2 if call_iv and put_iv else (call_iv or put_iv or 0)
                 data["skew"] = put_iv - call_iv if call_iv and put_iv else 0
 
@@ -365,3 +367,21 @@ class GreeksService:
             "surface": surface,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
+
+    async def fetch_oi_snapshot(self, underlying: str) -> List[dict]:
+        """
+        Fetch OI per strike from Tradier chain.
+        Uses the same chain fetching logic as get_chain_greeks but returns OI.
+        """
+        chain_data = await self._fetch_chain(underlying)
+        result = []
+        for opt in chain_data:
+            oi = opt.get("open_interest")
+            if oi is None:
+                continue
+            result.append({
+                "strike": float(opt.get("strike")),
+                "oi_total": int(oi),
+                "side": opt.get("option_type", "").upper(),
+            })
+        return result
