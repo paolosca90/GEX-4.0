@@ -32,18 +32,28 @@ interface FlowConcentration {
   dominant: 'call' | 'put';
 }
 
+interface OILevel {
+  strike: number;
+  oiDelta: number;
+  oiDeltaRetail: number;
+  oiDeltaBlock: number;
+  side: 'call' | 'put';
+}
+
 interface ChartProps {
   candles: CandleInput[];
   lastTick: TickData | null;
   gexData?: GexLevel[];
   keyLevels?: KeyLevels | null;
   flowConcentration?: FlowConcentration[];
+  oiLevels?: OILevel[];
   interval?: '1m' | '5m' | '15m';
   underlying?: string;
 }
 
-export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexData = [], keyLevels = null, flowConcentration = [], interval = '1m', underlying }) => {
+export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexData = [], keyLevels = null, flowConcentration = [], oiLevels = [], interval = '1m', underlying }) => {
   const API_BASE = `${window.location.protocol}//${window.location.host}`;
+  const SKEW_THRESHOLD = 0.15;
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -236,7 +246,6 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
       const spot = data.spot_price || 0;
       if (!spot) return;
 
-      const SKEW_THRESHOLD = 0.15;
       const zones: Array<{strike: number; skew: number; type: 'put' | 'call'}> = [];
       for (const s of strikes) {
         if (s.skew == null || s.call_iv == null || s.put_iv == null) continue;
@@ -259,9 +268,15 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
 
   useEffect(() => {
     if (underlying) {
+      let mounted = true;
       fetchSkewZones(underlying);
-      const interval = setInterval(() => fetchSkewZones(underlying), 120000);
-      return () => clearInterval(interval);
+      const interval = setInterval(() => {
+        if (mounted) fetchSkewZones(underlying);
+      }, 120000);
+      return () => {
+        mounted = false;
+        clearInterval(interval);
+      };
     }
   }, [underlying, fetchSkewZones]);
 
@@ -341,8 +356,6 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
     let lastYMap = '';
 
     const drawOverlay = () => {
-      animationFrameId = requestAnimationFrame(drawOverlay);
-
       if (!seriesRef.current) return;
 
       const width = canvas.width;
@@ -519,6 +532,62 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
       };
 
       drawSkewZones();
+
+      // ── OI Buildup Levels ───────────────────────────────────────────
+      if (oiLevels && oiLevels.length > 0 && seriesRef.current) {
+        const maxDelta = Math.max(...oiLevels.map(l => Math.abs(l.oiDelta)));
+        if (maxDelta > 0) {
+          for (const level of oiLevels) {
+            // Translate strike to future price using gexData
+            let futurePrice = level.strike;
+            const strikeData = gexData.find(g => Math.abs(g.strike - level.strike) < 1);
+            if (strikeData?.futurePrice) {
+              futurePrice = strikeData.futurePrice;
+            } else if (keyLevels?.call_wall?.price && keyLevels?.zgl?.price) {
+              const mult = keyLevels.call_wall.price / keyLevels.zgl.price;
+              futurePrice = level.strike * mult + keyLevels.zgl.price - level.strike;
+            }
+
+            const y = seriesRef.current.priceToCoordinate(futurePrice);
+            if (y === null || y < 0 || y > height) continue;
+
+            const isCall = level.side === 'call';
+            const color = isCall ? '#00C853' : '#FF1744';
+            const opacity = 0.6;
+            const isBlockOnly = Math.abs(level.oiDeltaBlock) > Math.abs(level.oiDeltaRetail);
+            const dashed = isBlockOnly;
+            const prefix = isCall ? 'C' : 'P';
+
+            const r = parseInt(color.slice(1, 3), 16);
+            const g = parseInt(color.slice(3, 5), 16);
+            const b = parseInt(color.slice(5, 7), 16);
+            const rgba = `rgba(${r},${g},${b},${opacity})`;
+
+            ctx.beginPath();
+            ctx.strokeStyle = rgba;
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash(dashed ? [6, 4] : []);
+            ctx.moveTo(0, y);
+            ctx.lineTo(width, y);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // Label
+            const labelText = `${prefix} ${level.strike.toFixed(0)} ${level.oiDelta >= 0 ? '+' : ''}${level.oiDelta}`;
+            ctx.font = '10px monospace';
+            const tm = ctx.measureText(labelText);
+            const lx = 4;
+            const ly = y - 2;
+            ctx.fillStyle = 'rgba(10,14,23,0.85)';
+            ctx.fillRect(lx - 3, ly - 10, tm.width + 6, 13);
+            ctx.fillStyle = rgba;
+            ctx.fillText(labelText, lx, ly);
+          }
+        }
+      }
+
+      // Schedule next frame at the END so we only continue when we actually drew
+      animationFrameId = requestAnimationFrame(drawOverlay);
     };
 
     drawOverlay();
@@ -526,7 +595,7 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
     return () => {
       cancelAnimationFrame(animationFrameId);
     };
-  }, [keyLevels, flowConcentration, containerSize]);
+  }, [keyLevels, flowConcentration, containerSize, skewZones, oiLevels]);
 
   return (
     <div style={{ position: 'relative', width: '100%', height: '100%', minHeight: '400px', backgroundColor: '#0a0e17' }}>
