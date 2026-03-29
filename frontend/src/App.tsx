@@ -68,6 +68,14 @@ export interface FlowConcentration {
   dominant: 'call' | 'put'
 }
 
+export interface OILevel {
+  strike: number
+  oiDelta: number
+  oiDeltaRetail: number
+  oiDeltaBlock: number
+  side: 'call' | 'put'
+}
+
 const ChartPanel: React.FC<ChartPanelProps> = ({ symbol, underlying, label, isExpanded, onExpandToggle }) => {
   const [candles, setCandles] = useState<CandleData[]>([])
   const [lastTick, setLastTick] = useState<TickData | null>(null)
@@ -75,6 +83,7 @@ const ChartPanel: React.FC<ChartPanelProps> = ({ symbol, underlying, label, isEx
   const [gexData, setGexData] = useState<GexLevel[]>([])
   const [keyLevels, setKeyLevels] = useState<KeyLevels | null>(null)
   const [flowConcentration, setFlowConcentration] = useState<FlowConcentration[]>([])
+  const [oiLevels, setOiLevels] = useState<OILevel[]>([])
 
   // Timeframe state
   const [intervalOption, setIntervalOption] = useState<'1m' | '5m' | '15m'>('1m')
@@ -177,6 +186,47 @@ const ChartPanel: React.FC<ChartPanelProps> = ({ symbol, underlying, label, isEx
     return () => clearInterval(interval)
   }, [underlying])
 
+  // Fetch OI buildup (top 3 calls + puts by delta)
+  useEffect(() => {
+    const fetchOiBuildup = async () => {
+      try {
+        const resp = await fetch(`${API_BASE}/api/oi/buildup/${underlying}`)
+        const data = await resp.json()
+        if (!data.calls && !data.puts) return
+
+        // Translate strikes to future prices using gexData
+        const translateStrike = (strike: number): number => {
+          const found = gexData.find(g => Math.abs(g.strike - strike) < 1)
+          if (found?.futurePrice) return found.futurePrice
+          // fallback: use lastPrice as approximation
+          return strike
+        }
+
+        const calls: OILevel[] = (data.calls || []).map((c: any) => ({
+          strike: c.strike,
+          oiDelta: c.oi_delta,
+          oiDeltaRetail: c.oi_delta_retail,
+          oiDeltaBlock: c.oi_delta_block,
+          side: 'call' as const,
+        }))
+        const puts: OILevel[] = (data.puts || []).map((p: any) => ({
+          strike: p.strike,
+          oiDelta: p.oi_delta,
+          oiDeltaRetail: p.oi_delta_retail,
+          oiDeltaBlock: p.oi_delta_block,
+          side: 'put' as const,
+        }))
+
+        setOiLevels([...calls, ...puts])
+      } catch (err) {
+        console.error('Failed to fetch OI buildup:', err)
+      }
+    }
+    fetchOiBuildup()
+    const interval = setInterval(fetchOiBuildup, 30000) // every 30s
+    return () => clearInterval(interval)
+  }, [underlying, gexData])
+
   useEffect(() => {
     const handleMarketTick = (e: CustomEvent<TickData>) => {
       const msg = e.detail
@@ -221,7 +271,7 @@ const ChartPanel: React.FC<ChartPanelProps> = ({ symbol, underlying, label, isEx
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         <div className="chart-container" style={{ flex: 1 }}>
           <div className="chart-main">
-            <LightweightChart candles={candles} lastTick={lastTick} gexData={gexData} keyLevels={keyLevels} flowConcentration={flowConcentration} underlying={underlying} />
+            <LightweightChart candles={candles} lastTick={lastTick} gexData={gexData} keyLevels={keyLevels} flowConcentration={flowConcentration} oiLevels={oiLevels} underlying={underlying} />
             <div
               className="smart-money-overlay"
               style={{ left: pos.x, top: pos.y }}
