@@ -57,6 +57,12 @@ async def init_db():
     except Exception as e:
         print(f"Hypertable options_flow notice: {e}")
 
+    # Add oi_delta column to options_flow
+    await conn.execute("""
+        ALTER TABLE options_flow ADD COLUMN IF NOT EXISTS oi_delta INTEGER;
+        COMMENT ON COLUMN options_flow.oi_delta IS 'Delta OI session-over-session for this strike, set on insert from batch OI snapshot';
+    """)
+
     # 3. Table for Daily GEX Profile
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS gex_profile (
@@ -156,6 +162,30 @@ async def init_db():
             updated_at TIMESTAMPTZ,
             PRIMARY KEY (date, underlying)
         );
+    """)
+
+    # 9. Table for OI Snapshots (30-min intervals)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS oi_snapshots (
+            time TIMESTAMPTZ NOT NULL,
+            underlying VARCHAR(10) NOT NULL,
+            strike DOUBLE PRECISION NOT NULL,
+            oi_total INTEGER NOT NULL,
+            oi_delta INTEGER NOT NULL,
+            oi_delta_retail INTEGER NOT NULL DEFAULT 0,
+            oi_delta_block INTEGER NOT NULL DEFAULT 0,
+            side VARCHAR(4) NOT NULL,
+            PRIMARY KEY (time, underlying, strike)
+        );
+    """)
+    try:
+        await conn.execute("SELECT create_hypertable('oi_snapshots', 'time', if_not_exists => TRUE);")
+    except Exception as e:
+        print(f"Hypertable oi_snapshots notice: {e}")
+
+    await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_oi_snapshots_underlying_strike
+        ON oi_snapshots (underlying, strike, time DESC);
     """)
 
     await conn.close()
