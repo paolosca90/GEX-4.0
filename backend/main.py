@@ -8,6 +8,7 @@ from greeks_service import GreeksService
 from alert_engine import AlertEngine
 from darkpool_analyzer import DarkPoolAnalyzer
 from reversal_engine import ReversalEngine
+from oi_tracker import OITracker
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gex_backend")
@@ -28,6 +29,7 @@ greeks_service = None
 alert_engine = None
 darkpool_analyzer = None
 reversal_engine = None
+oi_tracker = None
 
 @app.on_event("startup")
 async def startup_event():
@@ -48,13 +50,15 @@ async def startup_event():
     asyncio.create_task(start_gex_engine())
 
     # Initialize institutional MVP services
-    global greeks_service, alert_engine, darkpool_analyzer, reversal_engine
+    global greeks_service, alert_engine, darkpool_analyzer, reversal_engine, oi_tracker
     greeks_service = GreeksService(db_pool)
     alert_engine = AlertEngine(db_pool, broadcast_fn=manager.broadcast)
     darkpool_analyzer = DarkPoolAnalyzer(db_pool)
     reversal_engine = ReversalEngine(db_pool)
+    oi_tracker = OITracker(db_pool)
     asyncio.create_task(darkpool_analyzer.update_daily())
     asyncio.create_task(broadcast_reversal_signals())
+    asyncio.create_task(snapshot_oi_every_30min())
 
 
 # ──────────────────────────── WebSocket Manager ────────────────────────────
@@ -221,6 +225,25 @@ async def broadcast_reversal_signals():
         except Exception as e:
             logger.error(f"Reversal broadcast error: {e}")
         await asyncio.sleep(5)
+
+
+async def snapshot_oi_every_30min():
+    """Snapshot OI every 30 minutes during RTH (9:30-16:00 ET)."""
+    global oi_tracker, db_pool
+    await asyncio.sleep(10)  # wait for startup
+
+    while True:
+        try:
+            now_et = datetime.now(timezone(timedelta(hours=-5)))
+            hour = now_et.hour
+            # Only run during RTH: 9:30-16:00 ET (14:30-20:00 UTC)
+            if 14 <= hour < 20 and oi_tracker and db_pool:
+                await oi_tracker.snapshot_and_store("SPX")
+                await oi_tracker.snapshot_and_store("QQQ")
+                logger.info("OI snapshot completed for SPX and QQQ")
+        except Exception as e:
+            logger.error(f"OI snapshot error: {e}")
+        await asyncio.sleep(1800)  # 30 minutes
 
 
 # ──────────────────────────── REST Endpoints ────────────────────────────
@@ -1274,6 +1297,22 @@ async def get_darkpool_history(
         return {"history": []}
     data = await darkpool_analyzer.get_history(underlying.upper(), days)
     return {"history": data}
+
+
+# ──────────────────────────── OI Buildup Endpoint ────────────────────────────
+@app.get("/api/oi/buildup/{underlying}")
+async def get_oi_buildup(underlying: str):
+    """Return top 3 calls + top 3 puts per OI delta."""
+    if not oi_tracker:
+        return {"error": "OI tracker not initialized", "calls": [], "puts": []}
+    underlying = underlying.upper()
+    if underlying not in ("SPX", "QQQ"):
+        return {"error": "Invalid underlying", "calls": [], "puts": []}
+    try:
+        return oi_tracker.get_buildup(underlying)
+    except Exception as e:
+        logger.error(f"OI buildup error: {e}")
+        return {"error": str(e), "calls": [], "puts": []}
 
 
 # ──────────────────────────── WebSocket Endpoint ────────────────────────────
