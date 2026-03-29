@@ -1309,7 +1309,7 @@ async def get_oi_buildup(underlying: str):
     if underlying not in ("SPX", "QQQ"):
         return {"error": "Invalid underlying", "calls": [], "puts": []}
     try:
-        return oi_tracker.get_buildup(underlying)
+        return await oi_tracker.get_buildup(underlying)
     except Exception as e:
         logger.error(f"OI buildup error: {e}")
         return {"error": str(e), "calls": [], "puts": []}

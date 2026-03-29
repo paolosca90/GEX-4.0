@@ -131,9 +131,9 @@ class OITracker:
                    r["oi_delta"], r["oi_delta_retail"], r["oi_delta_block"], r["side"]) for r in records])
             logger.info(f"OI snapshot stored: {underlying} | {len(records)} strikes")
 
-    def get_buildup(self, underlying: str) -> dict:
+    async def get_buildup(self, underlying: str) -> dict:
         """Return top 3 calls + top 3 puts by absolute oi_delta from latest snapshot."""
-        rows = self.db.fetch("""
+        rows = await self.db.fetch("""
             SELECT DISTINCT ON (strike)
                 strike, oi_delta, oi_delta_retail, oi_delta_block, side
             FROM oi_snapshots
