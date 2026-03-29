@@ -1315,6 +1315,113 @@ async def get_oi_buildup(underlying: str):
         return {"error": str(e), "calls": [], "puts": []}
 
 
+@app.get("/api/oi/heatmap/{underlying}")
+async def get_oi_heatmap(underlying: str):
+    """
+    Return OI delta heatmap data for last 5 snapshots (2.5h).
+    Columns: timestamps of last 5 snapshots
+    Rows: strikes with OI delta + translated future price
+    """
+    if not db_pool:
+        return {"error": "DB not connected", "columns": [], "rows": []}
+    underlying = underlying.upper()
+    if underlying not in ("SPX", "QQQ"):
+        return {"error": "Invalid underlying", "columns": [], "rows": []}
+
+    try:
+        times_rows = await db_pool.fetch("""
+            SELECT DISTINCT time_bucket('30 min', time) as bucket
+            FROM oi_snapshots
+            WHERE underlying = $1
+              AND time > NOW() - INTERVAL '3 hours'
+            ORDER BY bucket DESC
+            LIMIT 5
+        """, underlying)
+
+        if not times_rows:
+            times_rows = await db_pool.fetch("""
+                SELECT DISTINCT time_bucket('30 min', time) as bucket
+                FROM oi_snapshots
+                WHERE underlying = $1
+                ORDER BY bucket DESC
+                LIMIT 5
+            """, underlying)
+
+        if not times_rows:
+            return {
+                "underlying": underlying,
+                "offset": 0,
+                "multiplier": 1.0,
+                "future_price": 0,
+                "columns": [],
+                "rows": [],
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        buckets = [r["bucket"] for r in reversed(times_rows)]
+
+        offset, multiplier = await get_dynamic_offset(underlying)
+        future_sym = 'US500-F' if underlying == 'SPX' else 'NAS100-F'
+        future_row = await db_pool.fetchrow("""
+            SELECT price FROM futures_ticks
+            WHERE symbol = $1 AND time > NOW() - INTERVAL '5 minutes'
+            ORDER BY time DESC LIMIT 1
+        """, future_sym)
+        future_price = float(future_row['price']) if future_row else 0
+
+        rows = await db_pool.fetch("""
+            SELECT
+                strike,
+                side,
+                time_bucket('30 min', time) as bucket,
+                oi_delta,
+                oi_delta_retail,
+                oi_delta_block
+            FROM oi_snapshots
+            WHERE underlying = $1
+              AND time_bucket('30 min', time) = ANY($2::timestamptz[])
+            ORDER BY strike, bucket
+        """, underlying, buckets)
+
+        strike_map = {}
+        for r in rows:
+            strike = float(r["strike"])
+            if strike not in strike_map:
+                if multiplier != 1.0:
+                    future_p = strike * multiplier + offset
+                else:
+                    future_p = strike + offset
+                strike_map[strike] = {
+                    "strike": strike,
+                    "future_price": round(future_p, 2),
+                    "side": r["side"].lower(),
+                    "snapshots": [None] * len(buckets)
+                }
+            bucket_idx = buckets.index(r["bucket"])
+            strike_map[strike]["snapshots"][bucket_idx] = {
+                "oi_delta": int(r["oi_delta"]),
+                "oi_delta_retail": int(r["oi_delta_retail"]),
+                "oi_delta_block": int(r["oi_delta_block"])
+            }
+
+        rows_list = sorted(strike_map.values(), key=lambda x: x["strike"])
+        column_labels = [b.strftime("%H:%M") for b in buckets]
+
+        return {
+            "underlying": underlying,
+            "offset": round(offset, 4),
+            "multiplier": round(multiplier, 6),
+            "future_price": round(future_price, 2),
+            "columns": column_labels,
+            "rows": rows_list,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    except Exception as e:
+        logger.error(f"OI heatmap error: {e}", exc_info=True)
+        return {"error": str(e), "columns": [], "rows": []}
+
+
 # ──────────────────────────── WebSocket Endpoint ────────────────────────────
 @app.websocket("/ws/market_data")
 async def websocket_endpoint(websocket: WebSocket):
