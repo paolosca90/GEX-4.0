@@ -92,6 +92,42 @@ function calcRR(entry: number, stop: number, target: number): number | null {
   return reward / risk
 }
 
+// ─── Theta burn calculator ────────────────────────────────────────────
+// Returns { thetaPerMin: number | null, isAccelerating: boolean }
+function getThetaBurn(greeks: GreeksData | null): { thetaPerMin: number | null; isAccelerating: boolean } {
+  if (!greeks || !greeks.chain || !greeks.spot || greeks.chain.length === 0) {
+    return { thetaPerMin: null, isAccelerating: false }
+  }
+
+  // Find ATM strike (closest to spot)
+  let atmTheta = 0
+  let atmCount = 0
+  for (const opt of greeks.chain) {
+    if (opt.theta == null) continue
+    const dist = Math.abs(opt.strike - greeks.spot)
+    const atmRange = greeks.spot * 0.02 // ATM ±2%
+    if (dist <= atmRange) {
+      atmTheta += opt.theta
+      atmCount++
+    }
+  }
+
+  if (atmCount === 0) {
+    return { thetaPerMin: null, isAccelerating: false }
+  }
+
+  const avgTheta = atmTheta / atmCount // This is already in $/contract/day typically
+  // Convert to $/min: divide by 390 (minutes in RTH trading day)
+  const thetaPerMin = Math.abs(avgTheta) / 390
+
+  // Acceleration: if we're in power hour (ET >= 14), theta accelerates 3-5x
+  const now = new Date()
+  const etHour = ((now.getUTCHours() - 5) + 24) % 24
+  const isAccelerating = etHour >= 14 && thetaPerMin > 0
+
+  return { thetaPerMin, isAccelerating }
+}
+
 // ─── Component dot classifier ──────────────────────────────────────────
 type DotState = 'confirming' | 'weak' | 'contrarian' | 'neutral'
 
