@@ -103,6 +103,81 @@ function classifyDot(comp: ComponentScore, overallDir: string): DotState {
 }
 
 export const ScalpingPanel: React.FC<ScalpingPanelProps> = ({ underlying }) => {
+  // ─── State hooks ───────────────────────────────────────────────────
+  const [data, setData] = useState<ReversalSignal | null>(null)
+  const [greeks, setGreeks] = useState<GreeksData | null>(null)
+  const [isLive, setIsLive] = useState(false)
+  const lastUpdateRef = useRef<number>(0)
+
+  // ─── Fetch reversal signal ──────────────────────────────────────────
+  const fetchSignal = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/reversal/${underlying}`)
+      if (resp.ok) {
+        const result: ReversalSignal = await resp.json()
+        if (result.confluence !== undefined) {
+          setData(result)
+          lastUpdateRef.current = Date.now()
+          setIsLive(true)
+        }
+      }
+    } catch (err) {
+      console.error('[ScalpingPanel] fetch error:', err)
+    }
+  }, [underlying])
+
+  // ─── Fetch Greeks ────────────────────────────────────────────────────
+  const fetchGreeks = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/greeks/${underlying}`)
+      if (resp.ok) {
+        const result = await resp.json()
+        setGreeks(result)
+      }
+    } catch (err) {
+      console.error('[ScalpingPanel] greeks fetch error:', err)
+    }
+  }, [underlying])
+
+  // ─── Initial fetch + polling ─────────────────────────────────────────
+  useEffect(() => {
+    fetchSignal()
+    fetchGreeks()
+  }, [fetchSignal, fetchGreeks])
+
+  useEffect(() => {
+    const signalInterval = setInterval(fetchSignal, 10000)
+    const greeksInterval = setInterval(fetchGreeks, 60000)
+    return () => {
+      clearInterval(signalInterval)
+      clearInterval(greeksInterval)
+    }
+  }, [fetchSignal, fetchGreeks])
+
+  // ─── WebSocket listener ──────────────────────────────────────────────
+  useEffect(() => {
+    const handleMessage = (e: CustomEvent) => {
+      const msg = e.detail
+      if (msg.type === 'reversal_signal' && msg.underlying === underlying) {
+        setData(msg as ReversalSignal)
+        lastUpdateRef.current = Date.now()
+        setIsLive(true)
+      }
+    }
+    window.addEventListener('market_tick', handleMessage as EventListener)
+    return () => window.removeEventListener('market_tick', handleMessage as EventListener)
+  }, [underlying])
+
+  // ─── Frozen check every 5s ───────────────────────────────────────────
+  useEffect(() => {
+    const check = setInterval(() => {
+      if (Date.now() - lastUpdateRef.current > 5000) {
+        setIsLive(false)
+      }
+    }, 5000)
+    return () => clearInterval(check)
+  }, [])
+
   return null // placeholder — full render implemented in Task 4
 }
 
