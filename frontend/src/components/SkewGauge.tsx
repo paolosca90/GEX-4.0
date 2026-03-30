@@ -21,7 +21,7 @@ interface SkewGaugeProps {
 }
 
 const API_BASE = `${window.location.protocol}//${window.location.host}`;
-const SKEW_THRESHOLD = 0.15; // 15%
+const SKEW_THRESHOLD = 0.03; // 3% - lowered from 15%
 
 export const SkewGauge: React.FC<SkewGaugeProps> = ({ underlying }) => {
   const [skewValue, setSkewValue] = useState<number | null>(null);
@@ -29,10 +29,12 @@ export const SkewGauge: React.FC<SkewGaugeProps> = ({ underlying }) => {
   const [loading, setLoading] = useState(true);
 
   const fetchSkew = useCallback(async () => {
+    setLoading(true);
     try {
       const resp = await fetch(`${API_BASE}/api/volatility/surface?underlying=${underlying}`);
       const data = await resp.json();
       if (data.error || !data.surface?.length) {
+        console.log(`[SkewGauge] No data for ${underlying}: error=${data.error}, surfaces=${data.surface?.length}`);
         setLoading(false);
         return;
       }
@@ -41,6 +43,7 @@ export const SkewGauge: React.FC<SkewGaugeProps> = ({ underlying }) => {
       const spot = data.spot_price || 0;
 
       if (!spot || !strikes.length) {
+        console.log(`[SkewGauge] Missing spot or strikes: spot=${spot}, strikes=${strikes.length}`);
         setLoading(false);
         return;
       }
@@ -53,6 +56,7 @@ export const SkewGauge: React.FC<SkewGaugeProps> = ({ underlying }) => {
       );
 
       if (!otmStrikes.length) {
+        console.log(`[SkewGauge] No OTM strikes in ATM range ${lower.toFixed(0)}-${upper.toFixed(0)} for ${underlying}`);
         setLoading(false);
         return;
       }
@@ -66,6 +70,7 @@ export const SkewGauge: React.FC<SkewGaugeProps> = ({ underlying }) => {
       }
 
       const avgSkew = totalGamma > 0 ? weightedSkew / totalGamma : 0;
+      console.log(`[SkewGauge] ${underlying}: avgSkew=${(avgSkew*100).toFixed(2)}%, ${otmStrikes.length} strikes`);
       setSkewValue(avgSkew);
 
       if (avgSkew > SKEW_THRESHOLD) {
@@ -75,9 +80,9 @@ export const SkewGauge: React.FC<SkewGaugeProps> = ({ underlying }) => {
       } else {
         setSkewDirection('neutral');
       }
-
       setLoading(false);
     } catch (e) {
+      console.error(`[SkewGauge] Error fetching skew for ${underlying}:`, e);
       setLoading(false);
     }
   }, [underlying]);

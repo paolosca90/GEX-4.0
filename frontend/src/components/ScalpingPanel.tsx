@@ -37,7 +37,7 @@ interface GreeksData {
 }
 
 interface ScalpingPanelProps {
-  underlying: 'SPX' | 'QQQ'
+  underlying: string
 }
 
 // ─── Constants ────────────────────────────────────────────────────────

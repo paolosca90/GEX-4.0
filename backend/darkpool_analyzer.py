@@ -6,6 +6,7 @@ import csv
 import io
 import logging
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 import httpx
 
@@ -24,7 +25,7 @@ class DarkPoolAnalyzer:
         self.db_pool = db_pool
         self.cache: dict[str, dict] = {}
 
-    async def download_and_parse(self, target_date: str | None = None) -> dict:
+    async def download_and_parse(self, target_date: Optional[str] = None) -> dict:
         """
         Download FINRA Reg SHO data for a given date.
         Returns {symbol: {short_volume, total_volume, short_ratio, dix}}.

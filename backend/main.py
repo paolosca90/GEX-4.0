@@ -203,9 +203,9 @@ async def _fetch_price_and_signal(underlying: str, futures_sym: str):
 
 
 async def broadcast_reversal_signals():
-    """Compute and broadcast reversal signals every 5 seconds."""
+    """Compute and broadcast reversal signals every second for real-time scalping."""
     global reversal_engine, db_pool
-    await asyncio.sleep(5)  # wait for startup
+    await asyncio.sleep(3)  # wait for startup
 
     while True:
         try:
@@ -224,7 +224,7 @@ async def broadcast_reversal_signals():
                         await alert_engine.fire_reversal_alert(signal)
         except Exception as e:
             logger.error(f"Reversal broadcast error: {e}")
-        await asyncio.sleep(5)
+        await asyncio.sleep(1)  # 1s for scalping responsiveness
 
 
 async def snapshot_oi_every_30min():
@@ -700,9 +700,12 @@ async def get_dynamic_offset(underlying: str):
         return (0.0, 1.0)
 
     # Map underlying to future and spot/index symbols
+    # BOTH SPX and QQQ use ADDITIVE offset: strike + (future - spot)
+    # QQQ strikes from Tradier are in QQQ points (e.g., 560 = $560 QQQ)
+    # The offset translates strike → future price: futurePrice = strike + (future - spot)
     symbol_map = {
-        'SPX': ('US500-F', 'SPX', 'US500', 'additive'),         # ES future - SPX index (Tradier real spot) - Fallback: cTrader US500
-        'QQQ': ('NAS100-F', 'QQQ', 'NAS100', 'multiplicative'),  # NQ future / QQQ ratio - Fallback: cTrader NAS100
+        'SPX': ('US500-F', 'SPX', 'US500', 'additive'),        # ES future - SPX index (Tradier real spot)
+        'QQQ': ('NAS100-F', 'QQQ', 'NAS100', 'additive'),      # NQ future - QQQ index (Tradier real spot)
     }
 
     if underlying not in symbol_map:
@@ -734,21 +737,17 @@ async def get_dynamic_offset(underlying: str):
             if spot_row:
                 spot_price = float(spot_row['price'])
             else:
-                # For multiplicative mode (QQQ): we need QQQ spot, NOT NAS100-CFD.
-                # If QQQ fresh (5min) is unavailable, try to get ANY QQQ from last 24h.
-                # The cTrader NAS100-CFD is NOT a valid substitute for QQQ in multiplicative mode.
-                if mode == 'multiplicative':
-                    any_qqq_row = await db_pool.fetchrow('''
-                        SELECT price FROM futures_ticks
-                        WHERE symbol = $1 AND time > NOW() - INTERVAL '24 hours'
-                        ORDER BY time DESC LIMIT 1
-                    ''', spot_sym)
-                    if any_qqq_row:
-                        spot_price = float(any_qqq_row['price'])
-                        source_sym = spot_sym
-                        logger.debug(f"Using stale QQQ price {spot_price} for {underlying} multiplier")
-                if spot_price is None:
-                    # Fallback to cTrader Cash CFD spot (only for additive mode, e.g. SPX)
+                # Try any spot price from last 24h
+                any_spot_row = await db_pool.fetchrow('''
+                    SELECT price FROM futures_ticks
+                    WHERE symbol = $1 AND time > NOW() - INTERVAL '24 hours'
+                    ORDER BY time DESC LIMIT 1
+                ''', spot_sym)
+                if any_spot_row:
+                    spot_price = float(any_spot_row['price'])
+                    logger.debug(f"Using stale spot price {spot_price} for {underlying}")
+                else:
+                    # Fallback to cTrader Cash CFD spot
                     fallback_row = await db_pool.fetchrow('''
                         SELECT price FROM futures_ticks
                         WHERE symbol = $1 AND time > NOW() - INTERVAL '24 hours'
@@ -760,15 +759,9 @@ async def get_dynamic_offset(underlying: str):
                         logger.debug(f"Using fallback cTrader Spot {fallback_spot_sym} for {underlying}")
 
             if spot_price is not None:
-                if mode == 'additive':
-                    offset = future_price - spot_price
-                    # Calculate exactly: US500-F - SPX = Offset
-                    logger.info(f"Dynamic offset for {underlying}: {future_sym}({future_price:.2f}) - {source_sym}({spot_price:.2f}) = +{offset:.2f} (additive)")
-                    return (offset, 1.0)
-                else:  # multiplicative
-                    ratio = future_price / spot_price
-                    logger.info(f"Dynamic ratio for {underlying}: {future_sym}({future_price:.2f}) / {source_sym}({spot_price:.2f}) = x{ratio:.4f} (multiplicative)")
-                    return (0.0, ratio)
+                offset = future_price - spot_price
+                logger.info(f"Dynamic offset for {underlying}: {future_sym}({future_price:.2f}) - {source_sym}({spot_price:.2f}) = +{offset:.2f}")
+                return (offset, 1.0)
             else:
                 logger.warning(f"Missing BOTH Tradier Spot and Fallback Spot for {underlying}")
         else:
@@ -777,10 +770,10 @@ async def get_dynamic_offset(underlying: str):
         logger.error(f"Error calculating offset: {e}")
 
     # Hardcoded fallback for QQQ when all data is stale (e.g., weekend with no QQQ data).
-    # NAS100-F / QQQ ≈ 41.4 (e.g., 23274 / 562 ≈ 41.4)
+    # Additive offset: NAS100-F - QQQ ≈ 23,440 (e.g., 24000 - 560 ≈ 23440)
     if underlying == 'QQQ':
-        logger.warning(f"Using hardcoded QQQ ratio 41.4 as last resort")
-        return (0.0, 41.4)
+        logger.warning(f"Using hardcoded QQQ offset 23440 as last resort")
+        return (23440.0, 1.0)
 
     return (0.0, 1.0)
 
@@ -864,7 +857,7 @@ async def get_gex_latest(underlying: str = Query(None, description="Filter by un
     sorted_levels = sorted(gex_data, key=lambda x: x["futurePrice"])
     cumulative = 0
     min_cumulative = float("inf")
-    zgl = sorted_levels[len(sorted_levels) // 2]["futurePrice"]
+    zgl = 0
     for level in sorted_levels:
         cumulative += level["gex"]
         if cumulative < min_cumulative:

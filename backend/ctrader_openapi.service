@@ -1,0 +1,17 @@
+[Unit]
+Description=cTrader OpenAPI Real-time Data Daemon
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/gex_dashboard/backend
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/gex_dashboard/backend/venv/bin/python3 /opt/gex_dashboard/backend/ctrader_openapi_daemon.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

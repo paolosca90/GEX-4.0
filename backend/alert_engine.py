@@ -33,8 +33,8 @@ class AlertEngine:
         self.db_pool = db_pool
         self.broadcast_fn = broadcast_fn
         self.config = dict(DEFAULT_CONFIG)
-        self.last_fired: dict[tuple, float] = {}
-        self.gex_cache: dict[str, dict] = {}
+        self.last_fired: dict = {}
+        self.gex_cache: dict = {}
 
     def update_gex_cache(self, underlying: str, gex_levels: list):
         """Called when GEX profile is refreshed. Extracts key levels."""
@@ -60,7 +60,7 @@ class AlertEngine:
         self.gex_cache[underlying] = {
             "zgl": zgl,
             "call_wall": call_wall.get("futurePrice", call_wall.get("strike", 0)) if call_wall else None,
-            "put_wall": put_wall.get("future_price", put_wall.get("strike", 0)) if put_wall else None,
+            "put_wall": put_wall.get("futurePrice", put_wall.get("strike", 0)) if put_wall else None,
             "regime": regime,
             "total_gex": total_gex,
         }
@@ -81,19 +81,18 @@ class AlertEngine:
             await self._fire("zgl_proximity", "HIGH", direction, underlying, price, gex["zgl"],
                 f"{underlying} {distance:.1f} pts from ZGL ({gex['zgl']:.0f}) - {gex['regime']}")
 
-        # A2: Wall Test - Call Wall
-        if gex.get("call_wall"):
-            distance = abs(price - gex["call_wall"])
-            if distance <= self.config["wall_proximity_points"]:
-                await self._fire("wall_test", "HIGH", "BEARISH", underlying, price, gex["call_wall"],
-                    f"{underlying} {distance:.1f} pts from Call Wall ({gex['call_wall']:.0f})")
-
-        # A2: Wall Test - Put Wall
-        if gex.get("put_wall"):
-            distance = abs(price - gex["put_wall"])
-            if distance <= self.config["wall_proximity_points"]:
-                await self._fire("wall_test", "HIGH", "BULLISH", underlying, price, gex["put_wall"],
-                    f"{underlying} {distance:.1f} pts from Put Wall ({gex['put_wall']:.0f})")
+        # A2: Wall Test — disabled (user preference)
+        # if gex.get("call_wall"):
+        #     distance = abs(price - gex["call_wall"])
+        #     if distance <= self.config["wall_proximity_points"]:
+        #         await self._fire("wall_test", "HIGH", "BEARISH", underlying, price, gex["call_wall"],
+        #             f"{underlying} {distance:.1f} pts from Call Wall ({gex['call_wall']:.0f})")
+        #
+        # if gex.get("put_wall"):
+        #     distance = abs(price - gex["put_wall"])
+        #     if distance <= self.config["wall_proximity_points"]:
+        #         await self._fire("wall_test", "HIGH", "BULLISH", underlying, price, gex["put_wall"],
+        #             f"{underlying} {distance:.1f} pts from Put Wall ({gex['put_wall']:.0f})")
 
     async def evaluate_flow(self, underlying: str, net_drift: float, call_premium: float, put_premium: float):
         """Called on every flow tick broadcast."""
@@ -155,3 +154,36 @@ class AlertEngine:
             FROM alerts ORDER BY time DESC LIMIT $1
         """, limit)
         return [dict(r) for r in rows]
+
+    async def fire_reversal_alert(self, signal: dict):
+        """Fire a reversal confluence alert when score >= 70."""
+        underlying = signal.get("underlying", "")
+        direction = signal.get("direction", "NEUTRAL")
+        confluence = signal.get("confluence", 0)
+        key_level = signal.get("key_level")
+        current_price = signal.get("current_price")
+
+        # Determine severity based on confluence
+        if confluence >= 85:
+            severity = "HIGH"
+        elif confluence >= 70:
+            severity = "MEDIUM"
+        else:
+            return
+
+        arrow = "▲" if direction == "BULLISH" else "▼"
+        msg = (
+            f"{arrow} {underlying} REVERSAL {direction} — "
+            f"Confluence: {confluence:.0f}% | "
+            f"Price: {current_price:.1f}"
+        )
+        if key_level:
+            msg += f" | Key Level: {key_level:.1f}"
+
+        await self._fire(
+            "reversal_confluence", severity, direction,
+            underlying, current_price, key_level, msg,
+            {"confluence": confluence, "components": {
+                k: v.get("score", 0) for k, v in signal.get("components", {}).items()
+            }}
+        )

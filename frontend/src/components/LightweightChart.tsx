@@ -200,6 +200,14 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
 
       const now = Math.floor(tickTimeMs / 1000);
 
+      // Validate tick price is within reasonable range (within 10% of last known price)
+      const lastKnownPrice = currentCandleRef.current.close;
+      const price = lastTick.price;
+      if (price < lastKnownPrice * 0.9 || price > lastKnownPrice * 1.1) {
+        // Discard outlier tick (likely bad data from API/daemon)
+        return;
+      }
+
       // Calculate bucket size based on interval
       const intervalSeconds: Record<string, number> = {
         '1m': 60,
@@ -212,13 +220,13 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
       let currentCandle = currentCandleRef.current;
 
       if (bucketTs > currentCandle.time) {
-        currentCandle = { time: bucketTs, open: lastTick.price, high: lastTick.price, low: lastTick.price, close: lastTick.price };
+        currentCandle = { time: bucketTs, open: price, high: price, low: price, close: price };
       } else {
         currentCandle = {
           ...currentCandle,
-          high: Math.max(currentCandle.high, lastTick.price),
-          low: Math.min(currentCandle.low, lastTick.price),
-          close: lastTick.price,
+          high: Math.max(currentCandle.high, price),
+          low: Math.min(currentCandle.low, price),
+          close: price,
         };
       }
 
@@ -336,10 +344,25 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
     return marginTop + chartAreaHeight * (1 - normalized);
   }, [rangeMin, totalRange, marginTop, chartAreaHeight]);
 
-  // Calculate max GEX for scaling
-  const maxGex = useMemo(() => {
-    return gexData.length > 0 ? Math.max(...gexData.map(g => Math.abs(g.gex))) : 0;
-  }, [gexData]);
+  // Translate a raw strike to future price for overlay positioning
+  // Uses gexData (preferred) or falls back to keyLevels ratio formula
+  const strikeToFuturePrice = useCallback((strike: number): number => {
+    // Preferred: use gexData which has exact futurePrice computed by backend
+    const strikeData = gexData.find(g => Math.abs(g.strike - strike) < 1);
+    if (strikeData?.futurePrice) return strikeData.futurePrice;
+
+    // Fallback: use keyLevels ratio to translate strike → future price
+    // Works for both additive (SPX: offset = CW - ZGL) and multiplicative (QQQ: mult = CW/ZGL)
+    if (keyLevels?.zgl?.price && keyLevels?.call_wall?.price) {
+      const zglPrice = keyLevels.zgl.price;
+      const cwPrice = keyLevels.call_wall.price;
+      const mult = cwPrice / zglPrice;  // ≈ 1 for SPX additive, ≈ 41.8 for QQQ multiplicative
+      const zglStrike = zglPrice / mult; // strike that maps to ZGL in future price space
+      return strike * mult + (zglPrice - zglStrike);  // simplifies to strike*mult for QQQ (offset≈0)
+    }
+
+    return strike;  // fallback to raw strike
+  }, [gexData, keyLevels]);
 
   // Key Levels + Flow Concentration Canvas Drawing
   useEffect(() => {
@@ -361,13 +384,13 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
       const width = canvas.width;
       const height = canvas.height;
 
-      // Build fingerprint from key level prices + concentration strikes
+      // Build fingerprint from key level prices + concentration strikes (translated to future prices)
       const kp = keyLevels
         ? [keyLevels.zgl, keyLevels.call_wall, keyLevels.put_wall, keyLevels.top_call, keyLevels.top_put]
             .filter(Boolean)
             .map(l => l!.price)
         : [];
-      const cp = (flowConcentration || []).map(l => l.strike);
+      const cp = (flowConcentration || []).map(l => strikeToFuturePrice(l.strike));
       const currentYMap = [...kp, ...cp]
         .map(p => seriesRef.current!.priceToCoordinate(p))
         .join('_');
@@ -439,7 +462,8 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
         const MAX_LW = 3;
 
         for (const level of flowConcentration) {
-          const y = seriesRef.current!.priceToCoordinate(level.strike);
+          const futurePrice = strikeToFuturePrice(level.strike);
+          const y = seriesRef.current!.priceToCoordinate(futurePrice);
           if (y === null || y < 0 || y > height) continue;
 
           const isCall = level.dominant === 'call';
@@ -487,21 +511,7 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
         const SKEW_THRESHOLD = 0.15;
 
         for (const zone of skewZones) {
-          const strike = zone.strike;
-          // Translate strike to future price using existing gexData (already computed with correct additive/multiplicative logic)
-          let futurePrice = strike;
-          const strikeData = gexData.find(g => Math.abs(g.strike - strike) < 1);
-          if (strikeData?.futurePrice) {
-            futurePrice = strikeData.futurePrice;
-          } else {
-            // Fallback: estimate from zgl and call_wall
-            if (keyLevels?.zgl?.price && keyLevels?.call_wall?.price) {
-              const mult = keyLevels.call_wall.price / keyLevels.zgl.price;
-              const zglStrike = keyLevels.zgl.price / mult;
-              futurePrice = strike * mult + (keyLevels.zgl.price - zglStrike);
-            }
-          }
-
+          const futurePrice = strikeToFuturePrice(zone.strike);
           const y = seriesRef.current.priceToCoordinate(futurePrice);
           if (y === null || y < 0 || y > height) return;
 
@@ -521,7 +531,7 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
           ctx.setLineDash([]);
           ctx.globalAlpha = 1;
 
-          const labelText = `${prefix} ${strike.toFixed(0)} ${skewPct}%`;
+          const labelText = `${prefix} ${zone.strike.toFixed(0)} ${skewPct}%`;
           ctx.font = '9px monospace';
           const tm = ctx.measureText(labelText);
           ctx.fillStyle = 'rgba(10,14,23,0.85)';
@@ -538,16 +548,7 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
         const maxDelta = Math.max(...oiLevels.map(l => Math.abs(l.oiDelta)));
         if (maxDelta > 0) {
           for (const level of oiLevels) {
-            // Translate strike to future price using gexData
-            let futurePrice = level.strike;
-            const strikeData = gexData.find(g => Math.abs(g.strike - level.strike) < 1);
-            if (strikeData?.futurePrice) {
-              futurePrice = strikeData.futurePrice;
-            } else if (keyLevels?.call_wall?.price && keyLevels?.zgl?.price) {
-              const mult = keyLevels.call_wall.price / keyLevels.zgl.price;
-              futurePrice = level.strike * mult + keyLevels.zgl.price - level.strike;
-            }
-
+            const futurePrice = strikeToFuturePrice(level.strike);
             const y = seriesRef.current.priceToCoordinate(futurePrice);
             if (y === null || y < 0 || y > height) continue;
 
