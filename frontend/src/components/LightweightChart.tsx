@@ -517,40 +517,13 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
       }
 
       // ── Skew Zones ──────────────────────────────────────────────────────────────
+      // DISABLED: Overlaps with flow concentration lines (same strikes, same colors)
+      // Blue/call skew zones duplicate orange/call flow concentration
+      // Red/put skew zones duplicate blue/put flow concentration
+      // Keeping flow concentration as the primary overlay is cleaner
       const drawSkewZones = () => {
-        if (!seriesRef.current || !skewZones.length || !keyLevels) return;
-
-        const SKEW_THRESHOLD = 0.15;
-
-        for (const zone of skewZones) {
-          const futurePrice = strikeToFuturePrice(zone.strike);
-          const y = seriesRef.current.priceToCoordinate(futurePrice);
-          if (y === null || y < 0 || y > height) return;
-
-          const isPut = zone.type === 'put';
-          const color = isPut ? '#ef4444' : '#3b82f6';
-          const skewPct = (Math.abs(zone.skew) * 100).toFixed(0);
-          const prefix = isPut ? 'PUT' : 'CALL';
-
-          ctx.beginPath();
-          ctx.strokeStyle = color;
-          ctx.lineWidth = 1;
-          ctx.setLineDash([6, 4]);
-          ctx.globalAlpha = 0.7;
-          ctx.moveTo(0, y);
-          ctx.lineTo(width, y);
-          ctx.stroke();
-          ctx.setLineDash([]);
-          ctx.globalAlpha = 1;
-
-          const labelText = `${prefix} ${zone.strike.toFixed(0)} ${skewPct}%`;
-          ctx.font = '9px monospace';
-          const tm = ctx.measureText(labelText);
-          ctx.fillStyle = 'rgba(10,14,23,0.85)';
-          ctx.fillRect(4, y - 10, tm.width + 6, 13);
-          ctx.fillStyle = color;
-          ctx.fillText(labelText, 6, y);
-        }
+        // Skew zones disabled to avoid visual overlap with flow concentration
+        // If needed, can be re-enabled with a toggle
       };
 
       drawSkewZones();

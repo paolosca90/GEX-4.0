@@ -48,34 +48,38 @@ export const SkewGauge: React.FC<SkewGaugeProps> = ({ underlying }) => {
         return;
       }
 
-      const lower = spot * 0.98;
-      const upper = spot * 1.02;
-      const otmStrikes = strikes.filter((s: StrikeData) =>
+      // Use ±5% range to capture full skew curve including OTM wings
+      const lower = spot * 0.95;
+      const upper = spot * 1.05;
+      const atmStrikes = strikes.filter((s: StrikeData) =>
         s.strike >= lower && s.strike <= upper &&
         s.call_iv != null && s.put_iv != null && s.gamma != null
       );
 
-      if (!otmStrikes.length) {
-        console.log(`[SkewGauge] No OTM strikes in ATM range ${lower.toFixed(0)}-${upper.toFixed(0)} for ${underlying}`);
+      if (!atmStrikes.length) {
+        console.log(`[SkewGauge] No ATM strikes in ${lower.toFixed(0)}-${upper.toFixed(0)} for ${underlying}`);
         setLoading(false);
         return;
       }
 
-      let totalGamma = 0;
-      let weightedSkew = 0;
-      for (const s of otmStrikes) {
-        const gamma = Math.abs(s.gamma || 0);
-        totalGamma += gamma;
-        weightedSkew += s.skew * gamma;
+      // Find the most negative skew (max downside risk) — not the average
+      // Average cancels put skew (-11%) with call skew (+11%) → near zero = WRONG
+      // Min skew correctly captures elevated put skew risk
+      let minSkew = 0;
+      for (const s of atmStrikes) {
+        const skew = s.skew || 0;
+        if (skew < minSkew) {
+          minSkew = skew;
+        }
       }
 
-      const avgSkew = totalGamma > 0 ? weightedSkew / totalGamma : 0;
-      console.log(`[SkewGauge] ${underlying}: avgSkew=${(avgSkew*100).toFixed(2)}%, ${otmStrikes.length} strikes`);
-      setSkewValue(avgSkew);
+      console.log(`[SkewGauge] ${underlying}: minSkew=${(minSkew*100).toFixed(2)}%, ${atmStrikes.length} strikes`);
+      setSkewValue(minSkew);
 
-      if (avgSkew > SKEW_THRESHOLD) {
+      // Negative skew = put skew (downside risk), positive skew = call skew (upside risk)
+      if (minSkew < -SKEW_THRESHOLD) {
         setSkewDirection('put');
-      } else if (avgSkew < -SKEW_THRESHOLD) {
+      } else if (minSkew > SKEW_THRESHOLD) {
         setSkewDirection('call');
       } else {
         setSkewDirection('neutral');
