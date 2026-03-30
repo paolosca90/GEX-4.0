@@ -5,8 +5,7 @@ import './App.css'
 import { GreeksPanel } from './components/GreeksPanel'
 import { AlertsPanel } from './components/AlertsPanel'
 import { DarkPoolPanel } from './components/DarkPoolPanel'
-import { ReversalGauge } from './components/ReversalGauge'
-import { VolSurface } from './components/VolSurface'
+import { ScalpingPanel } from './components/ScalpingPanel'
 import { SkewGauge } from './components/SkewGauge'
 import logo from './assets/gex.png'
 
@@ -285,8 +284,7 @@ const ChartPanel: React.FC<ChartPanelProps> = ({ symbol, underlying, label, isEx
           </div>
         </div>
         <div className="sidebar-panel" style={{ padding: '0.5rem', overflowY: 'auto' }}>
-          <ReversalGauge underlying={underlying} />
-          <VolSurface underlying={underlying} />
+          <ScalpingPanel underlying={underlying} />
           <SkewGauge underlying={underlying} />
           <GreeksPanel underlying={underlying} />
           <AlertsPanel />
