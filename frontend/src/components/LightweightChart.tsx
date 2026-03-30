@@ -185,7 +185,6 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
         close: c.close,
       }));
       seriesRef.current.setData(formattedData);
-      chartRef.current?.timeScale().fitContent();
       currentCandleRef.current = candles[candles.length - 1];
     }
   }, [candles]);
@@ -199,14 +198,7 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
       if (isNaN(tickTimeMs)) return;
 
       const now = Math.floor(tickTimeMs / 1000);
-
-      // Validate tick price is within reasonable range (within 10% of last known price)
-      const lastKnownPrice = currentCandleRef.current.close;
       const price = lastTick.price;
-      if (price < lastKnownPrice * 0.9 || price > lastKnownPrice * 1.1) {
-        // Discard outlier tick (likely bad data from API/daemon)
-        return;
-      }
 
       // Calculate bucket size based on interval
       const intervalSeconds: Record<string, number> = {
@@ -218,8 +210,19 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
       const bucketTs = now - (now % bucketSize);
 
       let currentCandle = currentCandleRef.current;
+      const isNewBucket = bucketTs > currentCandle.time;
 
-      if (bucketTs > currentCandle.time) {
+      // Validate tick price — only for ticks within current bucket
+      // (new bucket = fresh start, no validation needed on the open price)
+      if (!isNewBucket) {
+        const lastClose = currentCandle.close;
+        if (price < lastClose * 0.9 || price > lastClose * 1.1) {
+          // Discard outlier tick (likely bad data from API/daemon)
+          return;
+        }
+      }
+
+      if (isNewBucket) {
         currentCandle = { time: bucketTs, open: price, high: price, low: price, close: price };
       } else {
         currentCandle = {
@@ -228,6 +231,15 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
           low: Math.min(currentCandle.low, price),
           close: price,
         };
+      }
+
+      // Discard candle if high-low range exceeds 1% of close (anomalous candle guard)
+      if (currentCandle.close > 0) {
+        const rangePct = (currentCandle.high - currentCandle.low) / currentCandle.close;
+        if (rangePct > 0.01) {
+          // Skip this tick — would create an anomalously large candle
+          return;
+        }
       }
 
       currentCandleRef.current = currentCandle;
