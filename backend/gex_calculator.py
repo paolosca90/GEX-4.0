@@ -166,7 +166,23 @@ async def start_gex_engine():
     pool = await get_db_pool()
     engine = GEXEngine(pool)
     engine.start_background_tasks()
-    
+
+    # Immediately calculate today's 0DTE GEX if market is open (weekday, 09:30-16:00 ET)
+    # This ensures we have today's GEX data available during trading hours
+    now_est = datetime.now(timezone(timedelta(hours=-5)))
+    market_open = now_est.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now_est.replace(hour=16, minute=30, second=0, microsecond=0)
+    is_weekday = now_est.weekday() < 5
+    is_during_rth = market_open <= now_est <= market_close
+
+    if is_weekday and now_est < market_close:
+        # Before 16:30: calculate today's 0DTE if no data exists
+        logger.info(f"Running initial GEX calculation for today ({now_est.strftime('%H:%M:%S')} ET)...")
+        try:
+            await engine.calculate_0dte_gex_job()
+        except Exception as e:
+            logger.error(f"Initial GEX calculation failed: {e}")
+
     # Keep alive
     while True:
         await asyncio.sleep(3600)
