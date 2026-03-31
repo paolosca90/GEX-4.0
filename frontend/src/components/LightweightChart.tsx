@@ -212,14 +212,12 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
       let currentCandle = currentCandleRef.current;
       const isNewBucket = bucketTs > currentCandle.time;
 
-      // Validate tick price — only for ticks within current bucket
-      // (new bucket = fresh start, no validation needed on the open price)
-      if (!isNewBucket) {
-        const lastClose = currentCandle.close;
-        if (price < lastClose * 0.9 || price > lastClose * 1.1) {
-          // Discard outlier tick (likely bad data from API/daemon)
-          return;
-        }
+      // ALWAYS validate tick price against last close (previous candle's close)
+      // This prevents bad first-tick of new bucket from creating a giant candle
+      const lastClose = currentCandle.close;
+      if (price < lastClose * 0.9 || price > lastClose * 1.1) {
+        // Discard outlier tick (likely bad data from API/daemon)
+        return;
       }
 
       if (isNewBucket) {
