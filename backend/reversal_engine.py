@@ -455,16 +455,46 @@ class ReversalEngine:
         stop_level = None
         target_level = None
 
+        # Scale stop/target to futures price (NAS100 ~23300 vs US500 ~6450)
+        is_nasdaq = "NAS" in futures_symbol.upper() or underlying == "QQQ"
+        stop_pts = 15 if is_nasdaq else 8
+        target_pts = int(stop_pts * 1.5)  # 1.5:1 R:R
+
         if direction == "BEARISH":
-            key_level = gex.get("call_wall") or gex.get("zgl")
+            call_wall = gex.get("call_wall")
+            put_wall = gex.get("put_wall")
+            # Entry: price has rallied to resistance — entry = call_wall or close fallback
+            # call_wall should be ABOVE current and put_wall should be BELOW entry
+            if call_wall and call_wall > current_price + 15 and (not put_wall or put_wall < call_wall):
+                key_level = call_wall
+            else:
+                key_level = current_price + 20
+
             if key_level and current_price > 0:
-                stop_level = key_level + (abs(current_price - key_level) * 0.5)
-                target_level = gex.get("zgl") or gex.get("put_wall")
+                stop_level = key_level + stop_pts
+                # Target: put_wall if it's BELOW entry and BELOW current (downside potential)
+                if put_wall and put_wall < key_level and put_wall < current_price:
+                    target_level = put_wall
+                else:
+                    target_level = key_level - target_pts * 2
+
         elif direction == "BULLISH":
-            key_level = gex.get("put_wall") or gex.get("zgl")
+            call_wall = gex.get("call_wall")
+            put_wall = gex.get("put_wall")
+            # Entry: price has dropped to support — entry = put_wall or close fallback
+            # put_wall should be BELOW current and call_wall should be ABOVE entry
+            if put_wall and put_wall < current_price - 15 and (not call_wall or call_wall > put_wall):
+                key_level = put_wall
+            else:
+                key_level = current_price - 20
+
             if key_level and current_price > 0:
-                stop_level = key_level - (abs(current_price - key_level) * 0.5)
-                target_level = gex.get("zgl") or gex.get("call_wall")
+                stop_level = key_level - stop_pts
+                # Target: call_wall if it's ABOVE entry and ABOVE current (upside potential)
+                if call_wall and call_wall > key_level and call_wall > current_price:
+                    target_level = call_wall
+                else:
+                    target_level = key_level + target_pts * 2
 
         return {
             "confluence": round(composite, 1),
