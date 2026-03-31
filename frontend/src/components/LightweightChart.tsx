@@ -464,52 +464,134 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
         if (level) drawLine(level.price, color, opacity, lineWidth, dashed, labelPrefix);
       }
 
-      // ── Flow Concentration levels ──────────────────────────────────────
+      // ── Flow Concentration ZONES ──────────────────────────────────────
+      // Cluster nearby lines into zones to avoid visual overlap
       if (flowConcentration && flowConcentration.length > 0) {
-        // Find max premium for scaling line width
-        const maxPremium = Math.max(...flowConcentration.map(l => Math.max(l.call_premium, l.put_premium)));
-        const MIN_LW = 1;
-        const MAX_LW = 3;
+        const ZONE_PIXELS = 10; // Merge lines within 10px into a zone
 
-        for (const level of flowConcentration) {
-          const futurePrice = strikeToFuturePrice(level.strike);
-          const y = seriesRef.current!.priceToCoordinate(futurePrice);
-          if (y === null || y < 0 || y > height) continue;
+        // Convert to Y coordinates
+        const withY = flowConcentration
+          .map(level => ({
+            level,
+            futurePrice: strikeToFuturePrice(level.strike),
+            y: seriesRef.current!.priceToCoordinate(strikeToFuturePrice(level.strike)),
+          }))
+          .filter((l): l is typeof l & { y: number } => l.y !== null && l.y >= 0 && l.y <= height);
 
-          const isCall = level.dominant === 'call';
-          const premium = isCall ? level.call_premium : level.put_premium;
-          const color = isCall ? '#F97316' : '#3B82F6'; // orange=call, blue=put
-          const lineWidth = MIN_LW + (premium / maxPremium) * (MAX_LW - MIN_LW);
-          const opacity = 0.7;
-          const prefix = isCall ? 'CALL' : 'PUT';
+        if (withY.length === 0) return;
+
+        // Sort by Y (ascending = higher prices at top visually)
+        withY.sort((a, b) => b.y - a.y);
+
+        // Cluster into zones
+        interface Zone {
+          levels: typeof withY;
+          minY: number;
+          maxY: number;
+          dominant: 'call' | 'put';
+          totalCallPremium: number;
+          totalPutPremium: number;
+          strikeRange: string;
+        }
+
+        const zones: Zone[] = [];
+        let currentZone: Zone | null = null;
+
+        for (const item of withY) {
+          const isCall = item.level.dominant === 'call';
+          const premium = isCall ? item.level.call_premium : item.level.put_premium;
+
+          if (!currentZone) {
+            currentZone = {
+              levels: [item],
+              minY: item.y,
+              maxY: item.y,
+              dominant: item.level.dominant,
+              totalCallPremium: item.level.call_premium,
+              totalPutPremium: item.level.put_premium,
+              strikeRange: `${item.level.strike.toFixed(0)}`,
+            };
+          } else if (Math.abs(item.y - currentZone.maxY) <= ZONE_PIXELS) {
+            // Same zone
+            currentZone.levels.push(item);
+            currentZone.maxY = Math.max(currentZone.maxY, item.y);
+            currentZone.totalCallPremium += item.level.call_premium;
+            currentZone.totalPutPremium += item.level.put_premium;
+            currentZone.strikeRange = `${currentZone.levels[0].level.strike.toFixed(0)}-${item.level.strike.toFixed(0)}`;
+          } else {
+            // New zone
+            zones.push(currentZone);
+            currentZone = {
+              levels: [item],
+              minY: item.y,
+              maxY: item.y,
+              dominant: item.level.dominant,
+              totalCallPremium: item.level.call_premium,
+              totalPutPremium: item.level.put_premium,
+              strikeRange: `${item.level.strike.toFixed(0)}`,
+            };
+          }
+        }
+        if (currentZone) zones.push(currentZone);
+
+        // Draw zones
+        const maxPremium = Math.max(...zones.map(z =>
+          z.dominant === 'call' ? z.totalCallPremium : z.totalPutPremium
+        ));
+
+        for (const zone of zones) {
+          const isCall = zone.dominant === 'call';
+          const premium = isCall ? zone.totalCallPremium : zone.totalPutPremium;
+          const color = isCall ? '#F97316' : '#3B82F6';
+          const zoneTop = Math.min(zone.minY, zone.maxY);
+          const zoneBottom = Math.max(zone.minY, zone.maxY);
+          const zoneHeight = Math.max(zoneBottom - zoneTop, 4); // Min height
+
           const r = parseInt(color.slice(1, 3), 16);
           const g = parseInt(color.slice(3, 5), 16);
           const b = parseInt(color.slice(5, 7), 16);
-          const rgba = `rgba(${r},${g},${b},${opacity})`;
 
-          // Thin dashed line
+          // Draw zone band
+          const alpha = 0.25 + (premium / maxPremium) * 0.15;
+          ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
+          ctx.fillRect(0, zoneTop, width, zoneHeight);
+
+          // Draw zone borders (solid)
+          ctx.strokeStyle = `rgba(${r},${g},${b},0.6)`;
+          ctx.lineWidth = 1;
           ctx.beginPath();
-          ctx.strokeStyle = rgba;
-          ctx.lineWidth = lineWidth;
-          ctx.setLineDash([4, 4]);
-          ctx.moveTo(0, y);
-          ctx.lineTo(width, y);
+          ctx.moveTo(0, zoneTop);
+          ctx.lineTo(width, zoneTop);
+          ctx.moveTo(0, zoneBottom);
+          ctx.lineTo(width, zoneBottom);
+          ctx.stroke();
+
+          // Draw center line
+          const centerY = zoneTop + zoneHeight / 2;
+          ctx.beginPath();
+          ctx.strokeStyle = `rgba(${r},${g},${b},0.8)`;
+          ctx.lineWidth = 1;
+          ctx.setLineDash([3, 3]);
+          ctx.moveTo(0, centerY);
+          ctx.lineTo(width, centerY);
           ctx.stroke();
           ctx.setLineDash([]);
 
-          // Label with premium
-          const premiumLabel = premium >= 1e6
-            ? `$${(premium / 1e6).toFixed(1)}M`
-            : `$${(premium / 1e3).toFixed(0)}K`;
-          const labelText = `${prefix} ${level.strike.toFixed(0)} ${premiumLabel}`;
+          // Label
+          const totalPremium = zone.totalCallPremium + zone.totalPutPremium;
+          const premiumLabel = totalPremium >= 1e6
+            ? `$${(totalPremium / 1e6).toFixed(1)}M`
+            : `$${(totalPremium / 1e3).toFixed(0)}K`;
+          const prefix = isCall ? 'CALL' : 'PUT';
+          const labelText = `${prefix} ${zone.strikeRange} ${premiumLabel} (${zone.levels.length})`;
           ctx.font = '10px monospace';
           const tm = ctx.measureText(labelText);
           const pad = 3;
-          const lx = 4; // left edge for concentration labels
-          const ly = y - 2;
-          ctx.fillStyle = 'rgba(10,14,23,0.8)';
-          ctx.fillRect(lx - pad, ly - 10, tm.width + pad * 2, 13);
-          ctx.fillStyle = rgba;
+          const lx = 4;
+          const ly = centerY + 4;
+          ctx.fillStyle = 'rgba(10,14,23,0.85)';
+          ctx.fillRect(lx - pad, ly - 11, tm.width + pad * 2, 14);
+          ctx.fillStyle = `rgba(${r},${g},${b},1)`;
           ctx.fillText(labelText, lx, ly);
         }
       }

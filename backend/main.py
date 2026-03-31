@@ -700,12 +700,11 @@ async def get_dynamic_offset(underlying: str):
         return (0.0, 1.0)
 
     # Map underlying to future and spot/index symbols
-    # BOTH SPX and QQQ use ADDITIVE offset: strike + (future - spot)
-    # QQQ strikes from Tradier are in QQQ points (e.g., 560 = $560 QQQ)
-    # The offset translates strike → future price: futurePrice = strike + (future - spot)
+    # SPX: additive offset (strikes in SPX index points, futures in ES points, same scale ~10%)
+    # QQQ: MULTIPLICATIVE (strikes in QQQ ETF dollars, futures in NAS100 points ~42x larger)
     symbol_map = {
-        'SPX': ('US500-F', 'SPX', 'US500', 'additive'),        # ES future - SPX index (Tradier real spot)
-        'QQQ': ('NAS100-F', 'QQQ', 'NAS100', 'additive'),      # NQ future - QQQ index (Tradier real spot)
+        'SPX': ('US500-F', 'SPX', 'US500', 'additive'),
+        'QQQ': ('NAS100-F', 'QQQ', 'QQQ', 'multiplicative'),
     }
 
     if underlying not in symbol_map:
@@ -759,9 +758,19 @@ async def get_dynamic_offset(underlying: str):
                         logger.debug(f"Using fallback cTrader Spot {fallback_spot_sym} for {underlying}")
 
             if spot_price is not None:
-                offset = future_price - spot_price
-                logger.info(f"Dynamic offset for {underlying}: {future_sym}({future_price:.2f}) - {source_sym}({spot_price:.2f}) = +{offset:.2f}")
-                return (offset, 1.0)
+                if mode == 'multiplicative':
+                    # QQQ: strike (in QQQ dollars) → future price
+                    # QQQ at ~$558, NAS100-F at ~23,374 → multiplier ≈ 41.9
+                    multiplier = future_price / spot_price
+                    offset = 0.0
+                    logger.info(f"Dynamic offset for {underlying}: {future_sym}({future_price:.2f}) / {source_sym}({spot_price:.2f}) = x{multiplier:.4f}")
+                else:
+                    # SPX: strike (in SPX points) → future price
+                    # SPX at ~6343, US500-F at ~6455 → offset ≈ 112
+                    offset = future_price - spot_price
+                    multiplier = 1.0
+                    logger.info(f"Dynamic offset for {underlying}: {future_sym}({future_price:.2f}) - {source_sym}({spot_price:.2f}) = +{offset:.2f}")
+                return (offset, multiplier)
             else:
                 logger.warning(f"Missing BOTH Tradier Spot and Fallback Spot for {underlying}")
         else:
@@ -770,10 +779,10 @@ async def get_dynamic_offset(underlying: str):
         logger.error(f"Error calculating offset: {e}")
 
     # Hardcoded fallback for QQQ when all data is stale (e.g., weekend with no QQQ data).
-    # Additive offset: NAS100-F - QQQ ≈ 23,440 (e.g., 24000 - 560 ≈ 23440)
+    # QQQ ≈ 560, NAS100-F ≈ 23440 → multiplier ≈ 41.9
     if underlying == 'QQQ':
-        logger.warning(f"Using hardcoded QQQ offset 23440 as last resort")
-        return (23440.0, 1.0)
+        logger.warning(f"Using hardcoded QQQ multiplier 41.9 as last resort")
+        return (0.0, 41.9)
 
     return (0.0, 1.0)
 
