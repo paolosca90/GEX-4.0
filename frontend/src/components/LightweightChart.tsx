@@ -220,10 +220,18 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
         return;
       }
 
+      let newCandle: CandleInput;
       if (isNewBucket) {
-        currentCandle = { time: bucketTs, open: price, high: price, low: price, close: price };
+        // For new candle: validate OPEN is within 5% of previous close (strict on gap opens)
+        // Then immediately apply guard to prevent bad first-tick from creating giant candle
+        const gapPct = Math.abs(price - lastClose) / lastClose;
+        if (gapPct > 0.05) {
+          // New candle open is >5% from previous close — reject as anomalous gap
+          return;
+        }
+        newCandle = { time: bucketTs, open: price, high: price, low: price, close: price };
       } else {
-        currentCandle = {
+        newCandle = {
           ...currentCandle,
           high: Math.max(currentCandle.high, price),
           low: Math.min(currentCandle.low, price),
@@ -232,21 +240,22 @@ export const LightweightChart: React.FC<ChartProps> = ({ candles, lastTick, gexD
       }
 
       // Discard candle if high-low range exceeds 1% of close (anomalous candle guard)
-      if (currentCandle.close > 0) {
-        const rangePct = (currentCandle.high - currentCandle.low) / currentCandle.close;
+      if (newCandle.close > 0) {
+        const rangePct = (newCandle.high - newCandle.low) / newCandle.close;
         if (rangePct > 0.01) {
           // Skip this tick — would create an anomalously large candle
           return;
         }
       }
 
-      currentCandleRef.current = currentCandle;
+      // Only update state AFTER all validations pass (no drift between ref and series)
+      currentCandleRef.current = newCandle;
       seriesRef.current.update({
-        time: currentCandle.time as Time,
-        open: currentCandle.open,
-        high: currentCandle.high,
-        low: currentCandle.low,
-        close: currentCandle.close,
+        time: newCandle.time as Time,
+        open: newCandle.open,
+        high: newCandle.high,
+        low: newCandle.low,
+        close: newCandle.close,
       });
     } catch (e) {
       console.error("Chart update error:", e);

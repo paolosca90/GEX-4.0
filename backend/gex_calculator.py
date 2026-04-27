@@ -97,32 +97,39 @@ class GEXEngine:
                 continue
                 
             logger.info(f"Fetched {len(options)} options for {underlying} expiring {target_date_str}")
-            
+
             # Aggregate Gamma and OI by Strike
-            strike_data: dict[float, float] = {}
+            # IMPORTANT: Initialize ALL strikes with gex=0, even those without greeks.
+            # This ensures the full strike chain is preserved for accurate ZGL calculation.
+            # Deep OTM strikes have gamma≈0 but still contribute to the cumulative GEX profile.
+            all_strikes: dict[float, float] = {}
             for opt in options:
                 strike = float(opt['strike'])
-                opt_type = opt['option_type'] # 'call' or 'put'
+                all_strikes[strike] = 0.0
+
+            # Now add GEX only where gamma data is available
+            for opt in options:
+                strike = float(opt['strike'])
+                opt_type = opt['option_type']  # 'call' or 'put'
                 oi = float(opt.get('open_interest', 0))
-                
+
                 greeks = opt.get('greeks')
                 if not greeks:
                     continue
-                    
+
                 gamma = float(greeks.get('gamma', 0))
                 if gamma == 0 or oi == 0:
                     continue
-                
+
                 # GEX = Gamma * Open Interest * 100 * SpotPrice
                 # Call GEX is positive, Put GEX is negative
                 abs_gex = gamma * oi * 100 * spot_price
                 if opt_type == 'put':
                     abs_gex = -abs_gex
-                
-                if strike not in strike_data:
-                    strike_data[strike] = 0
-                strike_data[strike] += abs_gex
-                
+
+                all_strikes[strike] += abs_gex
+
+            strike_data = {k: v for k, v in all_strikes.items() if v != 0}
             if not strike_data:
                 logger.warning(f"No valid greeks/OI found for {underlying} on {target_date_str}")
                 continue
@@ -134,8 +141,14 @@ class GEXEngine:
             )
 
             inserted = 0
+            # For ZGL calculation we need the full strike chain, but for display
+            # we only want significant levels. Store all non-zero GEX strikes.
             for strike, total_gex in strike_data.items():
-                if total_gex == 0: continue
+                if total_gex == 0:
+                    # Still store near-market strikes (±5% of spot) even if gex≈0
+                    # This ensures ZGL calculation has full distribution
+                    if abs(strike - spot_price) / spot_price > 0.05:
+                        continue  # Skip far OTM strikes with zero gex
                 # Insert into DB
                 # translated_future_price is a legacy column required by schema
                 await self.db_pool.execute("""

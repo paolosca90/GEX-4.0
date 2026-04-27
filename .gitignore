@@ -1,34 +1,16 @@
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-venv/
-.venv/
-env/
+# Binary artifacts
+*.tar.gz
+*.zip
 
-# Node
-node_modules/
-
-# Build
-frontend/dist/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
+# Playwright
+.playwright-mcp/
 
 # OS
 .DS_Store
-Thumbs.db
 
-# Env
+# Environment
 .env
-*.env.local
-
-# Logs
 *.log
-
-# VPS backup
-vps_backup/
+__pycache__/
+venv/
+*.pyc
